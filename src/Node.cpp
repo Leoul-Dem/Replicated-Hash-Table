@@ -8,77 +8,50 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
-#include <sys/socket.h>
 #include <thread>
+#include <signal.h>
+
+Node::Node(const int port, const int argc, char** argv){
+    this->parse_node_addrs(argc, argv);
+    this->create_server(port);
+    this->establish_connections(my_idx);
+}
 
 void Node::parse_node_addrs(const int argc, char** argv){
+    my_idx = atoi(argv[1]);
 
-    const int8_t myIdx = atoi(argv[1]);
-    
     for (int i = 2; i < argc; i++) {
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(PORT);
-        inet_pton(AF_INET, argv[i], &addr.sin_addr);
-        all_nodes.push_back(addr);
+        asio::ip::tcp::endpoint ep(
+            asio::ip::make_address(argv[i]),
+            PORT
+        );
+        all_nodes.push_back(ep);
     }
-    indentify_peers(myIdx);
 }
 
-void Node::indentify_peers(const int myIdx){
-    if (myIdx == 0)
-        peers.left = all_nodes[all_nodes.size()-1];
-    else
-        peers.left = all_nodes[myIdx-1];
-
-
-    if (myIdx == all_nodes.size()-1)
-        peers.right = all_nodes[0];
-    else
-        peers.right = all_nodes[myIdx+1];
-
-    peers.farthest = all_nodes[(myIdx + static_cast<int>(all_nodes.size()) / 2) % static_cast<int>(all_nodes.size())];
-}
-
-int Node::create_server(const int port){
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == -1)
-        return -1;
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
-
-    if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == -1){
-        close(server_fd);
-        return -1;
-    }
-
-    return 0;
-}
-
-int Node::accept_conn() const{
-    sockaddr_in client_addr{};
-    socklen_t addr_len = sizeof(client_addr);
-    const int conn_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
-    if (conn_fd == -1) {
-        perror("accept");
-    }
-    return conn_fd;
+void Node::create_server(const int port){
+    acceptor = std::make_unique<asio::ip::tcp::acceptor>(
+        io_ctx,
+        asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)
+    );
+    acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
 }
 
 void Node::establish_connections(const int myIdx){
     // In a circular topology each node connects to its left, right, and farthest peers.
-    // To avoid deadlock we use a convention: a node initiates a connection to peers
-    // with a higher index and accepts connections from peers with a lower index.
+    // Each node accepts from lower-indexed peers and connects to higher-indexed peers.
+    // A background thread handles accepts concurrently with connects to avoid deadlock
+    // when farthest peers create out-of-order index dependencies.
 
-    peers.left_idx  = myIdx == 0 ? static_cast<int>(all_nodes.size()) - 1 : myIdx - 1;
-    peers.right_idx = myIdx == static_cast<int>(all_nodes.size()) - 1 ? 0 : myIdx + 1;
-    peers.farthest_idx = (myIdx + static_cast<int>(all_nodes.size()) / 2) % static_cast<int>(all_nodes.size());
+    const int N = static_cast<int>(all_nodes.size());
+    peers.left_idx  = myIdx == 0 ? N - 1 : myIdx - 1;
+    peers.right_idx = myIdx == N - 1 ? 0 : myIdx + 1;
+    peers.farthest_idx = (myIdx + N / 2) % N;
 
-    const int peer_indices[3]  = { peers.left_idx, peers.right_idx, peers.farthest_idx };
-    int* peer_conns[3]   = { &peers.left_conn, &peers.right_conn, &peers.farthest_conn };
+    const int peer_indices[3] = { peers.left_idx, peers.right_idx, peers.farthest_idx };
+    std::unique_ptr<asio::ip::tcp::socket>* peer_conns[3] = {
+        &peers.left_conn, &peers.right_conn, &peers.farthest_conn
+    };
 
     // Count how many peers we need to accept connections from (those with lower index)
     int accept_count = 0;
@@ -87,130 +60,142 @@ void Node::establish_connections(const int myIdx){
             accept_count++;
     }
 
-    // Listen for incoming connections from lower-indexed peers
-    if (accept_count > 0) {
-        listen(server_fd, accept_count);
+    acceptor->listen(accept_count);
 
+    // Accept from lower-indexed peers in a background thread so connects can proceed concurrently
+    std::thread accept_thread([&]() {
         for (int a = 0; a < accept_count; a++) {
-            sockaddr_in client_addr{};
-            socklen_t addr_len = sizeof(client_addr);
-            const int conn_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
-            if (conn_fd == -1) {
-                perror("accept");
-                continue;
-            }
+            auto sock = std::make_unique<asio::ip::tcp::socket>(acceptor->accept());
 
             // Match the accepted connection to the correct peer by address
+            auto remote_addr = sock->remote_endpoint().address();
             for (int i = 0; i < 3; i++) {
                 if (peer_indices[i] < myIdx &&
-                    client_addr.sin_addr.s_addr == all_nodes[peer_indices[i]].sin_addr.s_addr) {
-                    *peer_conns[i] = conn_fd;
+                    remote_addr == all_nodes[peer_indices[i]].address()) {
+                    *peer_conns[i] = std::move(sock);
                     break;
                 }
             }
         }
-    }
+    });
 
-    // Initiate connections to higher-indexed peers
+    // Initiate connections to higher-indexed peers concurrently with the accept thread
     for (int i = 0; i < 3; i++) {
         if (peer_indices[i] > myIdx) {
-            const int sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (sock == -1) {
-                perror("socket");
-                continue;
-            }
-
-            if (connect(sock, reinterpret_cast<sockaddr*>(&all_nodes[peer_indices[i]]),
-                        sizeof(sockaddr_in)) == -1) {
-                perror("connect");
-                close(sock);
-                continue;
-            }
-
-            *peer_conns[i] = sock;
+            auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
+            sock->connect(all_nodes[peer_indices[i]]);
+            *peer_conns[i] = std::move(sock);
         }
     }
+
+    accept_thread.join();
 }
 
-size_t Node::send_request(const Request &req, Response &resp){
-    std::array<uint8_t, BUF_SIZE> send_buf;
-    std::array<uint8_t, BUF_SIZE> recv_buf;
-    
+size_t Node::send_request(const Request_Full &req, Response_Full &resp){
+    std::array<uint8_t, BUF_SIZE> send_buf{};
+    std::array<uint8_t, BUF_SIZE> recv_buf{};
+    asio::error_code ec;
+
     serialize(req, send_buf);
     const uint8_t my_diff = std::abs(req.dest - req.src);
 
-
     if(const uint8_t farthest_diff = std::abs(req.dest - peers.farthest_idx); farthest_diff < my_diff + 1){
-        send(peers.farthest_conn, &send_buf, BUF_SIZE, 0);
-        
-        recv(peers.farthest_conn, &recv_buf, BUF_SIZE, 0);
+        std::lock_guard<std::mutex> lock(peers.farthest_mtx);
+        asio::write(*peers.farthest_conn, asio::buffer(send_buf), ec);
+        if(ec) return 0;
+        asio::read(*peers.farthest_conn, asio::buffer(recv_buf), ec);
+        if(ec) return 0;
         deserialize(recv_buf, resp);
-        
         return recv_buf.size();
     }
-    const int8_t N = static_cast<int8_t>(all_nodes.size());
+    const auto N = static_cast<int8_t>(all_nodes.size());
     const int8_t dest = req.dest;
 
     const int8_t left_dist  = (dest - my_idx + N) % N;
     const int8_t right_dist = (my_idx - dest + N) % N;
 
-    const int conn = left_dist <= right_dist ? peers.right_conn : peers.left_conn;
-    send(conn, &send_buf, BUF_SIZE, 0);
-        
-    recv(conn, &recv_buf, BUF_SIZE, 0);
+    if(left_dist <= right_dist){
+        std::lock_guard<std::mutex> lock(peers.right_mtx);
+        asio::write(*peers.right_conn, asio::buffer(send_buf), ec);
+        if(ec) return 0;
+        asio::read(*peers.right_conn, asio::buffer(recv_buf), ec);
+        if(ec) return 0;
+    } else {
+        std::lock_guard<std::mutex> lock(peers.left_mtx);
+        asio::write(*peers.left_conn, asio::buffer(send_buf), ec);
+        if(ec) return 0;
+        asio::read(*peers.left_conn, asio::buffer(recv_buf), ec);
+        if(ec) return 0;
+    }
     deserialize(recv_buf, resp);
-        
+
     return recv_buf.size();
 }
 
 
 void Node::recv_request(){
-    auto run = [this](int conn){
-        while(true){
-            std::array<uint8_t, BUF_SIZE> recv_buf;
-            std::array<uint8_t, BUF_SIZE> send_buf;
-            
-            recv(conn, &recv_buf, BUF_SIZE, 0);
-            Request req{};
-            Response resp{};
+    auto run = [this](asio::ip::tcp::socket& conn){
+        while(running.load()){
+            std::array<uint8_t, BUF_SIZE> recv_buf{};
+            std::array<uint8_t, BUF_SIZE> send_buf{};
+
+            asio::error_code ec;
+            asio::read(conn, asio::buffer(recv_buf), ec);
+            if (ec)
+                break;
+
+            Request_Full req{};
+            Response_Full resp{};
             deserialize(recv_buf, req);
-            
+
             handle_request(req, resp);
-            
+
             serialize(resp, send_buf);
-            send(conn, &send_buf, BUF_SIZE, 0);
+            asio::write(conn, asio::buffer(send_buf), ec);
+            if (ec)
+                break;
         }
     };
-    
-    std::thread t1(run, peers.left_conn);
-    std::thread t2(run, peers.right_conn);
-    std::thread t3(run, peers.farthest_conn);
-    
-    // stay here until sigterm
-    
-    
+
+    std::thread t1(run, std::ref(*peers.left_conn));
+    std::thread t2(run, std::ref(*peers.right_conn));
+    std::thread t3(run, std::ref(*peers.farthest_conn));
+
     t1.join();
     t2.join();
-    t3.join(); 
+    t3.join();
 }
 
-void Node::handle_request(const Request &req, Response &resp){
+void Node::stop(){
+    running.store(false);
+
+    // Closing sockets unblocks any blocked read()/write() calls
+    asio::error_code ec;
+    if(peers.left_conn)     peers.left_conn->close(ec);
+    if(peers.right_conn)    peers.right_conn->close(ec);
+    if(peers.farthest_conn) peers.farthest_conn->close(ec);
+}
+
+void Node::handle_request(const Request_Full &req, Response_Full &resp){
     switch (req.op) {
         case GET:{
             resp.id = req.id;
             resp.src = req.src;
             resp.dest = req.dest;
             resp.output = this->get(req.inputs[0].key);
+            break;
         }
+
         case PUT:{
             resp.id = req.id;
             resp.src = req.src;
             resp.dest = req.dest;
-            if(req.inputs.size() < 3){
-                resp.output[1] = this->put(req.inputs[0]) ? '1' : '\0';
+            if(req.input_count < 3){
+                resp.success = this->put(req.inputs[0], false);
             }else{
-                resp.output[1] = this->put(req.inputs) ? '1' : '\0';
+                resp.success = this->put(req.inputs, false);
             }
+            break;
         }
     }
 }

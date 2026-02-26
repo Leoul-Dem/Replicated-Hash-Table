@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 include_directories(libs)
 include_directories(libs/data_structures)
 include_directories(libs/data_structures/hashmap)
+include_directories(libs/networking)
 
 add_executable(Replicated_Hash_Table
         libs/data_structures/hashmap/bits.hpp
@@ -15,6 +16,11 @@ add_executable(Replicated_Hash_Table
         libs/data_structures/hashmap/phmap_fwd_decl.hpp
         libs/data_structures/hashmap/phmap_utils.hpp
         libs/data_structures/concurrentqueue.h
-        src/node_map.h
+        libs/networking/asio.hpp
         src/Node.cpp
-        src/Node.h)
+        src/Node.h
+        src/Pub_API.cpp
+        src/Server.cpp
+        src/Client.cpp
+        src/main.cpp
+)
