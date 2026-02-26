@@ -97,9 +97,14 @@ size_t Node::send_request(const Request_Full &req, Response_Full &resp){
     asio::error_code ec;
 
     serialize(req, send_buf);
-    const uint8_t my_diff = std::abs(req.dest - req.src);
+    const auto N = static_cast<int8_t>(all_nodes.size());
+    const auto ring_dist = [N](int8_t a, int8_t b) -> uint8_t {
+        int8_t d = (b - a + N) % N;
+        return std::min(static_cast<uint8_t>(d), static_cast<uint8_t>(N - d));
+    };
+    const uint8_t my_diff = ring_dist(req.src, req.dest);
 
-    if(const uint8_t farthest_diff = std::abs(req.dest - peers.farthest_idx); farthest_diff < my_diff + 1){
+    if(const uint8_t farthest_diff = ring_dist(peers.farthest_idx, req.dest); farthest_diff < my_diff + 1){
         std::lock_guard<std::mutex> lock(peers.farthest_mtx);
         asio::write(*peers.farthest_conn, asio::buffer(send_buf), ec);
         if(ec) return 0;
@@ -108,13 +113,12 @@ size_t Node::send_request(const Request_Full &req, Response_Full &resp){
         deserialize(recv_buf, resp);
         return recv_buf.size();
     }
-    const auto N = static_cast<int8_t>(all_nodes.size());
     const int8_t dest = req.dest;
 
     const int8_t left_dist  = (dest - my_idx + N) % N;
     const int8_t right_dist = (my_idx - dest + N) % N;
 
-    if(left_dist <= right_dist){
+    if(left_dist >= right_dist){
         std::lock_guard<std::mutex> lock(peers.right_mtx);
         asio::write(*peers.right_conn, asio::buffer(send_buf), ec);
         if(ec) return 0;
@@ -190,7 +194,7 @@ void Node::handle_request(const Request_Full &req, Response_Full &resp){
             resp.id = req.id;
             resp.src = req.src;
             resp.dest = req.dest;
-            if(req.input_count < 3){
+            if(req.input_count == 1){
                 resp.success = this->put(req.inputs[0], false);
             }else{
                 resp.success = this->put(req.inputs, false);

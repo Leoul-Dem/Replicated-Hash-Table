@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <system_error>
 #include <thread>
 
 int runClient(moodycamel::ConcurrentQueue<Request_Cut> &req_queue,
@@ -46,20 +47,14 @@ int runClient(moodycamel::ConcurrentQueue<Request_Cut> &req_queue,
                 continue;
             }
 
-            auto it = map.find(resp.id);
-            if(it == map.end())
-                continue;
-
-            Op op = it->second;
-            bool valid = false;
-            if(op == Op::GET){
-                valid = std::any_of(resp.output.begin(), resp.output.end(), [](char c){ return c != 0; });
-            } else {
-                valid = resp.output[0] == '1';
-            }
-
-            if(valid)
-                map.erase(it);
+            map.erase_if(resp.id, [&resp](const auto& item){
+                Op op = item.second;
+                if(op == Op::GET){
+                    return std::any_of(resp.output.begin(), resp.output.end(), [](char c){ return c != 0; });
+                } else {
+                    return resp.success;
+                }
+            });
         }
     };
 

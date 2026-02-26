@@ -28,12 +28,18 @@ class Node{
         int8_t right_idx;
         int8_t farthest_idx;
     };
+    
+    gtl::parallel_flat_hash_map<int32_t, std::array<char, VALUE_SIZE>> todo_1;
+    gtl::parallel_flat_hash_map<int32_t, std::array<char, VALUE_SIZE>> todo_2;
 
     gtl::parallel_flat_hash_map_m<int32_t, std::array<char, VALUE_SIZE>> table_1;
     gtl::parallel_flat_hash_map_m<int32_t, std::array<char, VALUE_SIZE>> table_2;
 
-    std::shared_timed_mutex t1_mtx;
-    std::shared_timed_mutex t2_mtx;
+    static constexpr size_t NUM_STRIPES = 256;
+    std::array<std::shared_timed_mutex, NUM_STRIPES> t1_locks;
+    std::array<std::shared_timed_mutex, NUM_STRIPES> t2_locks;
+
+    static size_t stripe(int32_t key) { return static_cast<uint32_t>(key) % NUM_STRIPES; }
 
     std::vector<asio::ip::tcp::endpoint> all_nodes;
 
