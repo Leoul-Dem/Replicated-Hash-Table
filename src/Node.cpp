@@ -84,7 +84,7 @@ void Node::establish_connections(const int myIdx){
     for (int i = 0; i < 3; i++) {
         if (peer_indices[i] > myIdx) {
             asio::error_code ec;
-            for (int attempt = 0; attempt < 30; attempt++) {
+            for (int attempt = 0; attempt < 120; attempt++) {
                 auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
                 sock->connect(all_nodes[peer_indices[i]], ec);
                 if (!ec) {

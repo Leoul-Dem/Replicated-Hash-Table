@@ -1,12 +1,15 @@
-cmake_minimum_required(VERSION 4.1)
+cmake_minimum_required(VERSION 3.16)
 project(Replicated_Hash_Table)
 
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -pthread")
 
 include_directories(libs)
 include_directories(libs/data_structures)
 include_directories(libs/data_structures/hashmap)
 include_directories(libs/networking)
+
 
 add_executable(Replicated_Hash_Table
         libs/data_structures/hashmap/bits.hpp
