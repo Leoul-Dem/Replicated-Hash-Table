@@ -79,12 +79,25 @@ void Node::establish_connections(const int myIdx){
         }
     });
 
-    // Initiate connections to higher-indexed peers concurrently with the accept thread
+    // Initiate connections to higher-indexed peers concurrently with the accept thread.
+    // Retry with backoff since peers may not be listening yet.
     for (int i = 0; i < 3; i++) {
         if (peer_indices[i] > myIdx) {
-            auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
-            sock->connect(all_nodes[peer_indices[i]]);
-            *peer_conns[i] = std::move(sock);
+            asio::error_code ec;
+            for (int attempt = 0; attempt < 30; attempt++) {
+                auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
+                sock->connect(all_nodes[peer_indices[i]], ec);
+                if (!ec) {
+                    *peer_conns[i] = std::move(sock);
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            if (ec) {
+                std::fprintf(stderr, "Failed to connect to node %d after retries: %s\n",
+                             peer_indices[i], ec.message().c_str());
+                std::exit(1);
+            }
         }
     }
 
