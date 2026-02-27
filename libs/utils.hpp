@@ -12,10 +12,12 @@ constexpr size_t BUF_SIZE = 1024;
 
 enum Op : uint8_t {
     PUT,
-    PUT_NOT_OG,
     GET,
     PUT3,
-    PUT3_NOT_OG,
+    PREPARE_PUT,
+    PREPARE_PUT3,
+    COMMIT,
+    ABORT,
 };
 
 // Wire-friendly KV pair (fixed size)
@@ -27,6 +29,7 @@ struct WireKV {
 // Wire-format request (fixed size for simple send/recv)
 struct Request {
     uint32_t id;
+    uint64_t tx_id;            // 2PC transaction ID
     int8_t src;
     int8_t dest;
     Op op;
@@ -37,6 +40,7 @@ struct Request {
 // Wire-format response (fixed size)
 struct Response {
     uint32_t id;
+    uint64_t tx_id;
     int8_t src;
     int8_t dest;
     bool success;

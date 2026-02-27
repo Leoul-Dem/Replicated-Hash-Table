@@ -7,6 +7,7 @@
 #include <thread>
 #include <algorithm>
 #include <sys/socket.h>
+#include <set>
 
 static void set_sock_timeout(asio::ip::tcp::socket &sock, int seconds) {
     struct timeval tv;
@@ -17,7 +18,8 @@ static void set_sock_timeout(asio::ip::tcp::socket &sock, int seconds) {
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-Node::Node(int port, const int argc, const char** argv) : PORT(port) {
+Node::Node(int port, const int argc, const char** argv)
+    : PORT(port) {
     parse_node_addrs(argc, argv);
     create_server(port);
     establish_conns(my_idx);
@@ -27,10 +29,15 @@ void Node::parse_node_addrs(const int argc, const char** argv){
     my_idx = std::atoi(argv[1]);
 
     for (int i = 3; i < argc; i++) {
-        asio::ip::tcp::endpoint ep(
-            asio::ip::make_address(argv[i]),
-            PORT
-        );
+        std::string arg(argv[i]);
+        auto colon = arg.rfind(':');
+        if (colon == std::string::npos) {
+            std::fprintf(stderr, "Bad address (expected ip:port): %s\n", argv[i]);
+            std::exit(1);
+        }
+        std::string ip = arg.substr(0, colon);
+        int port = std::atoi(arg.substr(colon + 1).c_str());
+        asio::ip::tcp::endpoint ep(asio::ip::make_address(ip), port);
         all_nodes.push_back(ep);
     }
 }
@@ -59,18 +66,18 @@ void Node::establish_conns(int myIdx){
 
     std::vector<int> accepted_per_peer(N, 0);
 
+    // Handshake: connector sends its 1-byte index, acceptor reads it to identify peer
     std::thread accept_thread([&]() {
         for (int a = 0; a < accept_count; a++) {
             auto sock = std::make_unique<asio::ip::tcp::socket>(acceptor->accept());
-            auto remote_addr = sock->remote_endpoint().address();
-            for (int i = 0; i < N; i++) {
-                if (i < myIdx &&
-                    remote_addr == all_nodes[i].address() &&
-                    accepted_per_peer[i] < CONNS_PER_PEER) {
-                    conns[i][accepted_per_peer[i]] = std::move(sock);
-                    accepted_per_peer[i]++;
-                    break;
-                }
+            uint8_t peer_idx = 0;
+            std::error_code ec;
+            asio::read(*sock, asio::buffer(&peer_idx, 1), ec);
+            if (ec || peer_idx >= N || peer_idx >= myIdx) continue;
+            int pi = static_cast<int>(peer_idx);
+            if (accepted_per_peer[pi] < CONNS_PER_PEER) {
+                conns[pi][accepted_per_peer[pi]] = std::move(sock);
+                accepted_per_peer[pi]++;
             }
         }
     });
@@ -84,8 +91,13 @@ void Node::establish_conns(int myIdx){
                     auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
                     sock->connect(all_nodes[i], ec);
                     if (!ec) {
-                        conns[i][c] = std::move(sock);
-                        break;
+                        // Send our index as handshake
+                        uint8_t idx_byte = static_cast<uint8_t>(myIdx);
+                        asio::write(*sock, asio::buffer(&idx_byte, 1), ec);
+                        if (!ec) {
+                            conns[i][c] = std::move(sock);
+                            break;
+                        }
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
@@ -100,12 +112,14 @@ void Node::establish_conns(int myIdx){
 
     accept_thread.join();
 
-    // Set timeouts on all sockets so blocking IO breaks during shutdown
+    // Set timeouts and TCP_NODELAY on all sockets
     for (int i = 0; i < N; i++) {
         if (i == myIdx) continue;
         for (int c = 0; c < CONNS_PER_PEER; c++) {
-            if (conns[i][c])
+            if (conns[i][c]) {
                 set_sock_timeout(*conns[i][c], 1);
+                conns[i][c]->set_option(asio::ip::tcp::no_delay(true));
+            }
         }
     }
 }
@@ -138,7 +152,6 @@ void Node::recv_request(){
             std::error_code ec;
             asio::read(conn, asio::buffer(recv_buf), ec);
             if (ec) {
-                // On timeout, re-check running flag instead of breaking
                 if (ec == asio::error::would_block || ec == asio::error::try_again)
                     continue;
                 break;
@@ -180,58 +193,98 @@ void Node::stop(){
     for (int i = 0; i < N; i++) {
         if (i == my_idx) continue;
         for (int c = 0; c < CONNS_PER_PEER; c++) {
-            if (conns[i][c] && conns[i][c]->is_open())
+            if (conns[i][c] && conns[i][c]->is_open()) {
+                conns[i][c]->shutdown(asio::ip::tcp::socket::shutdown_both, ec);
                 conns[i][c]->close(ec);
+            }
         }
     }
 }
 
+// ─── handle_request: dispatches incoming RPCs ───────────────────────────────
+
 void Node::handle_request(const Request &req, Response &resp){
     resp.id = req.id;
+    resp.tx_id = req.tx_id;
     resp.src = req.src;
     resp.dest = req.dest;
 
     switch (req.op) {
         case GET: {
-            std::string result = get(req.inputs[0].key);
+            // Read locally — no 2PC needed
+            std::shared_lock<std::shared_timed_mutex> lk(locks[stripe(req.inputs[0].key)]);
+            std::string result;
+            table.if_contains(req.inputs[0].key, [&result](const auto& item) {
+                result = item.second;
+            });
             std::memset(resp.output, 0, MAX_VAL_SIZE);
-            std::memcpy(resp.output, result.data(),
-                        std::min(result.size(), MAX_VAL_SIZE));
+            std::memcpy(resp.output, result.data(), std::min(result.size(), MAX_VAL_SIZE));
             resp.success = !result.empty();
             break;
         }
-        case PUT: {
-            std::string val(req.inputs[0].value, strnlen(req.inputs[0].value, MAX_VAL_SIZE));
-            resp.success = put(req.inputs[0].key, val);
+        case PREPARE_PUT:
+        case PREPARE_PUT3:
+            resp.success = handle_prepare(req);
             break;
-        }
-        case PUT_NOT_OG: {
-            std::string val(req.inputs[0].value, strnlen(req.inputs[0].value, MAX_VAL_SIZE));
-            resp.success = put_not_og(req.inputs[0].key, val);
+        case COMMIT:
+            handle_commit(req.tx_id);
+            resp.success = true;
             break;
-        }
-        case PUT3: {
-            std::array<KV_Pair, 3> kvs;
-            for (int i = 0; i < 3; i++) {
-                kvs[i].key = req.inputs[i].key;
-                kvs[i].value = std::string(req.inputs[i].value, strnlen(req.inputs[i].value, MAX_VAL_SIZE));
-            }
-            resp.success = put3(kvs);
+        case ABORT:
+            handle_abort(req.tx_id);
+            resp.success = true;
             break;
-        }
-        case PUT3_NOT_OG: {
-            std::array<KV_Pair, 3> kvs;
-            for (int i = 0; i < 3; i++) {
-                kvs[i].key = req.inputs[i].key;
-                kvs[i].value = std::string(req.inputs[i].value, strnlen(req.inputs[i].value, MAX_VAL_SIZE));
-            }
-            resp.success = put3_not_og(kvs);
+        default:
+            resp.success = false;
             break;
-        }
     }
 }
 
-// --- helpers ---
+// ─── 2PC participant handlers (NO outbound RPCs) ────────────────────────────
+
+bool Node::handle_prepare(const Request &req) {
+    // PREPARE: just stage the KVs, no locks held across phases
+    PendingTx tx;
+    for (int i = 0; i < req.input_count; i++) {
+        std::string val(req.inputs[i].value, strnlen(req.inputs[i].value, MAX_VAL_SIZE));
+        tx.kvs.emplace_back(req.inputs[i].key, std::move(val));
+    }
+
+    std::lock_guard<std::mutex> lk(pending_mtx);
+    pending_txs[req.tx_id] = std::move(tx);
+    return true;
+}
+
+void Node::handle_commit(uint64_t tx_id) {
+    PendingTx tx;
+    {
+        std::lock_guard<std::mutex> lk(pending_mtx);
+        auto it = pending_txs.find(tx_id);
+        if (it == pending_txs.end()) return;
+        tx = std::move(it->second);
+        pending_txs.erase(it);
+    }
+
+    // Lock stripes (sorted to avoid deadlock), apply, unlock
+    std::set<size_t> stripes;
+    for (auto& [key, val] : tx.kvs)
+        stripes.insert(stripe(key));
+
+    std::vector<std::unique_lock<std::shared_timed_mutex>> held;
+    for (size_t s : stripes)
+        held.emplace_back(locks[s]);
+
+    for (auto& [key, val] : tx.kvs)
+        table.insert_or_assign(key, val);
+    // locks released when `held` goes out of scope
+}
+
+void Node::handle_abort(uint64_t tx_id) {
+    std::lock_guard<std::mutex> lk(pending_mtx);
+    pending_txs.erase(tx_id);
+}
+
+// ─── helpers ────────────────────────────────────────────────────────────────
 
 static void fill_wire_kv(WireKV &wkv, int32_t key, const std::string &val) {
     wkv.key = key;
@@ -239,195 +292,183 @@ static void fill_wire_kv(WireKV &wkv, int32_t key, const std::string &val) {
     std::memcpy(wkv.value, val.data(), std::min(val.size(), MAX_VAL_SIZE));
 }
 
-// --- Public API ---
+// ─── 2PC coordinator: put() ─────────────────────────────────────────────────
 
 bool Node::put(const int32_t &key, const std::string &val){
     const auto N = static_cast<int8_t>(all_nodes.size());
     int8_t owner = key % N;
+    int8_t replica = (owner + 1) % N;
+    uint64_t txid = next_tx_id();
 
-    if (owner == my_idx) {
-        std::unique_lock<std::shared_timed_mutex> lk(locks[stripe(key)]);
+    // Determine which remote nodes to contact
+    // Participants: owner and replica (may include us)
+    std::set<int8_t> remote_participants;
+    if (owner != my_idx) remote_participants.insert(owner);
+    if (replica != my_idx) remote_participants.insert(replica);
 
-        // Synchronous replica write
-        int8_t rep = replica_idx();
-        Request req{};
-        req.src = my_idx;
-        req.dest = rep;
-        req.op = PUT_NOT_OG;
-        req.input_count = 1;
-        fill_wire_kv(req.inputs[0], key, val);
+    // Phase 1: PREPARE
+    bool all_ok = true;
+    std::set<int8_t> voted_yes;  // remote nodes that said yes
 
-        Response resp{};
-        send_request(rep, req, resp);
-
-        if (resp.success) {
-            table.insert_or_assign(key, val);
-            return true;
+    // Prepare locally if we're a participant
+    bool local_participant = (owner == my_idx || replica == my_idx);
+    bool local_prepared = false;
+    if (local_participant) {
+        PendingTx tx;
+        tx.kvs.emplace_back(key, val);
+        {
+            std::lock_guard<std::mutex> lk(pending_mtx);
+            pending_txs[txid] = std::move(tx);
         }
-        return false;
-    } else {
-        // Forward to owner
-        Request req{};
-        req.src = my_idx;
-        req.dest = owner;
-        req.op = PUT;
-        req.input_count = 1;
-        fill_wire_kv(req.inputs[0], key, val);
-
-        Response resp{};
-        send_request(owner, req, resp);
-        return resp.success;
-    }
-}
-
-bool Node::put_not_og(const int32_t &key, const std::string &val){
-    std::unique_lock<std::shared_timed_mutex> lk(locks[stripe(key)]);
-    table.insert_or_assign(key, val);
-    return true;
-}
-
-bool Node::put3(const std::array<KV_Pair, 3> &kvs){
-    const auto N = static_cast<int8_t>(all_nodes.size());
-
-    // Group keys by owner
-    // For each key: if we own it, write locally + fire-and-forget replica
-    // If remote owns it, send PUT3_NOT_OG to that owner (they write locally)
-    // Fire-and-forget: we don't wait for replica ACKs
-
-    // Lock local stripes first (sorted to prevent deadlock)
-    std::array<int, 3> order = {0, 1, 2};
-    std::sort(order.begin(), order.end(), [&](int a, int b){
-        return stripe(kvs[a].key) < stripe(kvs[b].key);
-    });
-
-    std::array<std::unique_lock<std::shared_timed_mutex>, 3> local_locks;
-    for (int i = 0; i < 3; i++) {
-        int idx = order[i];
-        int8_t owner = kvs[idx].key % N;
-        if (owner == my_idx || (owner + 1) % N == my_idx) {
-            // We hold this key locally (as primary or replica)
-            if (i > 0 && stripe(kvs[order[i]].key) == stripe(kvs[order[i-1]].key))
-                continue;
-            local_locks[idx] = std::unique_lock<std::shared_timed_mutex>(
-                locks[stripe(kvs[idx].key)], std::chrono::milliseconds(5));
-            if (!local_locks[idx].owns_lock()) return false;
-        }
+        local_prepared = true;
     }
 
-    // Send fire-and-forget replica writes for keys we own
-    for (int i = 0; i < 3; i++) {
-        int8_t owner = kvs[i].key % N;
-        if (owner == my_idx) {
-            int8_t rep = replica_idx();
+    // Prepare remote participants
+    if (all_ok) {
+        for (int8_t dest : remote_participants) {
             Request req{};
+            req.tx_id = txid;
             req.src = my_idx;
-            req.dest = rep;
-            req.op = PUT_NOT_OG;
+            req.dest = dest;
+            req.op = PREPARE_PUT;
             req.input_count = 1;
-            fill_wire_kv(req.inputs[0], kvs[i].key, kvs[i].value);
+            fill_wire_kv(req.inputs[0], key, val);
 
             Response resp{};
-            send_request(rep, req, resp);
-            // Fire and forget — don't check resp.success
-        }
-    }
-
-    // Send PUT3_NOT_OG to remote owners for keys we don't own
-    // Group by owner to batch
-    struct RemoteGroup { int8_t dest; std::vector<int> indices; };
-    std::vector<RemoteGroup> remote_groups;
-
-    for (int i = 0; i < 3; i++) {
-        int8_t owner = kvs[i].key % N;
-        if (owner == my_idx) continue;
-
-        bool found = false;
-        for (auto& g : remote_groups) {
-            if (g.dest == owner) {
-                g.indices.push_back(i);
-                found = true;
+            send_request(dest, req, resp);
+            if (resp.success) {
+                voted_yes.insert(dest);
+            } else {
+                all_ok = false;
                 break;
             }
         }
-        if (!found)
-            remote_groups.push_back({owner, {i}});
     }
 
-    for (auto& g : remote_groups) {
-        Request req{};
-        req.src = my_idx;
-        req.dest = g.dest;
-        req.op = PUT3_NOT_OG;
-        req.input_count = static_cast<uint8_t>(g.indices.size());
-        for (size_t j = 0; j < g.indices.size(); j++) {
-            fill_wire_kv(req.inputs[j], kvs[g.indices[j]].key, kvs[g.indices[j]].value);
+    // Phase 2: COMMIT or ABORT
+    if (all_ok) {
+        // Commit remote
+        for (int8_t dest : voted_yes) {
+            Request req{};
+            req.tx_id = txid;
+            req.src = my_idx;
+            req.dest = dest;
+            req.op = COMMIT;
+            Response resp{};
+            send_request(dest, req, resp);
         }
-
-        Response resp{};
-        send_request(g.dest, req, resp);
-        // Fire and forget
-    }
-
-    // Write all locally-held keys
-    for (int i = 0; i < 3; i++) {
-        int8_t owner = kvs[i].key % N;
-        if (owner == my_idx || (owner + 1) % N == my_idx) {
-            table.insert_or_assign(kvs[i].key, kvs[i].value);
+        // Commit local
+        if (local_prepared) handle_commit(txid);
+        return true;
+    } else {
+        // Abort remote
+        for (int8_t dest : voted_yes) {
+            Request req{};
+            req.tx_id = txid;
+            req.src = my_idx;
+            req.dest = dest;
+            req.op = ABORT;
+            Response resp{};
+            send_request(dest, req, resp);
         }
+        // Abort local
+        if (local_prepared) handle_abort(txid);
+        return false;
     }
-
-    return true;
 }
 
-bool Node::put3_not_og(const std::array<KV_Pair, 3> &kvs){
-    // Called on a remote primary that received keys from the coordinator.
-    // Write locally + fire-and-forget replica for keys we own.
+// ─── 2PC coordinator: put3() ────────────────────────────────────────────────
+
+bool Node::put3(const std::array<KV_Pair, 3> &kvs){
     const auto N = static_cast<int8_t>(all_nodes.size());
+    uint64_t txid = next_tx_id();
 
-    // Lock stripes
-    std::array<int, 3> order = {0, 1, 2};
-    std::sort(order.begin(), order.end(), [&](int a, int b){
-        return stripe(kvs[a].key) < stripe(kvs[b].key);
-    });
+    // For each key, determine owner and replica
+    // Group KVs by participant node (each node gets the KVs it holds as owner OR replica)
+    struct ParticipantData {
+        std::vector<std::pair<int32_t, std::string>> kvs;
+    };
+    std::unordered_map<int8_t, ParticipantData> participants;
 
-    std::array<std::unique_lock<std::shared_timed_mutex>, 3> local_locks;
-    for (int i = 0; i < 3; i++) {
-        int idx = order[i];
-        int8_t owner = kvs[idx].key % N;
-        if (owner != my_idx) continue;
-        if (i > 0 && stripe(kvs[order[i]].key) == stripe(kvs[order[i-1]].key))
-            continue;
-        local_locks[idx] = std::unique_lock<std::shared_timed_mutex>(
-            locks[stripe(kvs[idx].key)], std::chrono::milliseconds(5));
-        if (!local_locks[idx].owns_lock()) return false;
-    }
-
-    // Fire-and-forget replica writes
     for (int i = 0; i < 3; i++) {
         int8_t owner = kvs[i].key % N;
-        if (owner != my_idx) continue;
-
-        int8_t rep = replica_idx();
-        Request req{};
-        req.src = my_idx;
-        req.dest = rep;
-        req.op = PUT_NOT_OG;
-        req.input_count = 1;
-        fill_wire_kv(req.inputs[0], kvs[i].key, kvs[i].value);
-
-        Response resp{};
-        send_request(rep, req, resp);
+        int8_t replica = (owner + 1) % N;
+        participants[owner].kvs.emplace_back(kvs[i].key, kvs[i].value);
+        if (replica != owner)
+            participants[replica].kvs.emplace_back(kvs[i].key, kvs[i].value);
     }
 
-    // Write locally
-    for (int i = 0; i < 3; i++) {
-        int8_t owner = kvs[i].key % N;
-        if (owner != my_idx) continue;
-        table.insert_or_assign(kvs[i].key, kvs[i].value);
+    bool all_ok = true;
+    std::set<int8_t> voted_yes;
+    bool local_prepared = false;
+
+    // Prepare local if we're a participant
+    auto local_it = participants.find(my_idx);
+    if (local_it != participants.end()) {
+        PendingTx tx;
+        tx.kvs = local_it->second.kvs;
+        {
+            std::lock_guard<std::mutex> lk(pending_mtx);
+            pending_txs[txid] = std::move(tx);
+        }
+        local_prepared = true;
     }
 
-    return true;
+    // Prepare remote participants
+    if (all_ok) {
+        for (auto& [node_id, pdata] : participants) {
+            if (node_id == my_idx) continue;
+
+            Request req{};
+            req.tx_id = txid;
+            req.src = my_idx;
+            req.dest = node_id;
+            req.op = PREPARE_PUT3;
+            req.input_count = static_cast<uint8_t>(pdata.kvs.size());
+            for (size_t j = 0; j < pdata.kvs.size() && j < 3; j++) {
+                fill_wire_kv(req.inputs[j], pdata.kvs[j].first, pdata.kvs[j].second);
+            }
+
+            Response resp{};
+            send_request(node_id, req, resp);
+            if (resp.success) {
+                voted_yes.insert(node_id);
+            } else {
+                all_ok = false;
+                break;
+            }
+        }
+    }
+
+    // Phase 2
+    if (all_ok) {
+        for (int8_t dest : voted_yes) {
+            Request req{};
+            req.tx_id = txid;
+            req.src = my_idx;
+            req.dest = dest;
+            req.op = COMMIT;
+            Response resp{};
+            send_request(dest, req, resp);
+        }
+        if (local_prepared) handle_commit(txid);
+        return true;
+    } else {
+        for (int8_t dest : voted_yes) {
+            Request req{};
+            req.tx_id = txid;
+            req.src = my_idx;
+            req.dest = dest;
+            req.op = ABORT;
+            Response resp{};
+            send_request(dest, req, resp);
+        }
+        if (local_prepared) handle_abort(txid);
+        return false;
+    }
 }
+
+// ─── get() — unchanged, no 2PC needed ───────────────────────────────────────
 
 std::string Node::get(const int32_t &key){
     const auto N = static_cast<int8_t>(all_nodes.size());

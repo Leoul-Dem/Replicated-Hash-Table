@@ -39,3 +39,16 @@
 
 # debug information files
 *.dwo
+
+.gitignore
+
+GenAI_Disclaimer.txt
+
+HW2-spec.txt
+
+new_changes.md
+
+.idea/
+.claude
+
+cmake-build-debug

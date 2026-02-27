@@ -9,8 +9,8 @@
 
 // [program] [my_index] [port] [n * ip addresses]
 int main(const int argc, const char** argv){
-    if(argc < 7){
-        std::cout << "Usage: " << argv[0] << " <index> <port> <ip1> <ip2> ... <ipN>\n";
+    if(argc < 5){
+        std::cout << "Usage: " << argv[0] << " <index> <my_port> <ip:port1> <ip:port2> ... <ip:portN>\n";
         return -1;
     }
 

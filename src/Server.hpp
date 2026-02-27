@@ -34,7 +34,7 @@ inline int runServer(const int port, const int argc, const char** argv,
             Response_Cut resp{};
 
             if(!req_queue.try_dequeue(req)){
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
                 continue;
             }
 
@@ -89,20 +89,21 @@ inline int runServer(const int port, const int argc, const char** argv,
         latencies_us.insert(latencies_us.end(), local_latencies.begin(), local_latencies.end());
     };
 
-    std::thread t1(run);
-    std::thread t2(run);
-    std::thread t3(run);
-    std::thread t4(&Node::recv_request, &node);
+    constexpr int NUM_WORKERS = 4;
+    std::vector<std::thread> workers;
+    workers.reserve(NUM_WORKERS);
+    for (int i = 0; i < NUM_WORKERS; i++)
+        workers.emplace_back(run);
+
+    std::thread recv_thread(&Node::recv_request, &node);
 
     while(running.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     node.stop();
 
-    t1.join();
-    t2.join();
-    t3.join();
-    t4.join();
+    for (auto& t : workers) t.join();
+    recv_thread.join();
 
     // Print stats
     auto end_time = std::chrono::steady_clock::now();
@@ -115,18 +116,28 @@ inline int runServer(const int port, const int argc, const char** argv,
     std::fprintf(stdout, "Throughput:       %.2f ops/s\n", total_success / elapsed_s);
 
     if(!latencies_us.empty()){
-        std::sort(latencies_us.begin(), latencies_us.end());
-        size_t n = latencies_us.size();
-        double sum = 0;
-        for(double v : latencies_us) sum += v;
+        // Filter out shutdown artifacts (ops > 2s are stuck during teardown)
+        constexpr double CUTOFF_US = 2'000'000.0;
+        std::vector<double> filtered;
+        filtered.reserve(latencies_us.size());
+        for (double v : latencies_us)
+            if (v <= CUTOFF_US) filtered.push_back(v);
 
-        std::fprintf(stdout, "Total operations: %zu\n", n);
-        std::fprintf(stdout, "Avg latency:      %.2f us\n", sum / n);
-        std::fprintf(stdout, "P50 latency:      %.2f us\n", latencies_us[n / 2]);
-        std::fprintf(stdout, "P90 latency:      %.2f us\n", latencies_us[n * 90 / 100]);
-        std::fprintf(stdout, "P99 latency:      %.2f us\n", latencies_us[n * 99 / 100]);
-        std::fprintf(stdout, "Min latency:      %.2f us\n", latencies_us.front());
-        std::fprintf(stdout, "Max latency:      %.2f us\n", latencies_us.back());
+        std::sort(filtered.begin(), filtered.end());
+        size_t n = filtered.size();
+
+        if (n > 0) {
+            double sum = 0;
+            for(double v : filtered) sum += v;
+
+            std::fprintf(stdout, "Total operations: %zu\n", n);
+            std::fprintf(stdout, "Avg latency:      %.2f us\n", sum / n);
+            std::fprintf(stdout, "P50 latency:      %.2f us\n", filtered[n / 2]);
+            std::fprintf(stdout, "P90 latency:      %.2f us\n", filtered[n * 90 / 100]);
+            std::fprintf(stdout, "P99 latency:      %.2f us\n", filtered[n * 99 / 100]);
+            std::fprintf(stdout, "Min latency:      %.2f us\n", filtered.front());
+            std::fprintf(stdout, "Max latency:      %.2f us\n", filtered.back());
+        }
     }
     std::fprintf(stdout, "=========================\n");
 

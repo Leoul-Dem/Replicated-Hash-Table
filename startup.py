@@ -1,199 +1,98 @@
 #!/usr/bin/env python3
 
+import os
 import re
+import signal
 import subprocess
 import sys
 import time
 
 # ─── Configuration ───────────────────────────────────────────────────────────
-SSH_USER = "lgd226"
-DOMAIN = "cse.lehigh.edu"
-PROGRAM_PATH = "~/z_new_project/build/Replicated_Hash_Table"  # <── CHANGE THIS
+PROGRAM_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "Replicated_Hash_Table")
 NUM_NODES = 6
 TMUX_SESSION = "rht"
-ALLOWED_PORTS = [1895, 4040, 4041] + list(range(6000, 6011))
-
-MACHINES = [
-    "caliban", "callisto", "ceres", "chiron", "cupid",
-    "eris", "europa", "hydra", "iapetus", "io", "ixion",
-    "mars", "mercury", "neptune", "nereid", "nix", "orcus",
-    "phobos", "puck", "saturn", "triton", "varda", "vesta", "xena",
-]
+BASE_PORT = 7000          # Each node gets BASE_PORT + index
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def ssh_host(machine: str) -> str:
-    return f"{SSH_USER}@{machine}.{DOMAIN}"
-
-
-def run_ssh(machine: str, cmd: str, timeout: int = 10) -> str | None:
-    """Run a command on a remote machine via SSH. Returns stdout or None on failure."""
-    try:
-        result = subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
-             ssh_host(machine), cmd],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-        return None
-    except (subprocess.TimeoutExpired, Exception):
-        return None
-
-
-def get_load(machine: str) -> float | None:
-    """Get 1-minute load average from a machine."""
-    out = run_ssh(machine, "cat /proc/loadavg")
-    if out:
-        try:
-            return float(out.split()[0])
-        except (ValueError, IndexError):
-            return None
-    return None
-
-
-def get_ip(machine: str) -> str | None:
-    """Resolve the IP address of a machine."""
-    out = run_ssh(machine, "hostname -I")
-    if out:
-        return out.split()[0]
-    return None
-
-
-def pick_best_machines(n: int) -> list[str]:
-    """Survey all machines and return the n with the lowest load."""
-    print(f"Surveying {len(MACHINES)} machines for load averages...")
-    loads: list[tuple[str, float]] = []
-
-    for m in MACHINES:
-        load = get_load(m)
-        if load is not None:
-            loads.append((m, load))
-            print(f"  {m:12s}  load: {load:.2f}")
-        else:
-            print(f"  {m:12s}  unreachable")
-
-    loads.sort(key=lambda x: x[1])
-    return loads
-
-
-def select_and_resolve(n: int) -> tuple[list[str], list[str]]:
-    """Pick n machines with lowest load that also resolve an IP."""
-    ranked = pick_best_machines(n * 2)
-
-    print("Resolving IP addresses...")
-    machines: list[str] = []
-    ips: list[str] = []
-    for name, load in ranked:
-        if len(machines) >= n:
-            break
-        ip = get_ip(name)
-        if ip is None:
-            print(f"  {name:12s}  SKIPPED (could not resolve IP)")
-            continue
-        machines.append(name)
-        ips.append(ip)
-        print(f"  {name:12s}  ->  {ip}")
-
-    if len(machines) < n:
-        print(f"  ERROR: only found {len(machines)} usable machines (need {n})", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"\nSelected machines: {machines}")
-    return machines, ips
-
-
-def is_port_free(machine: str, port: int) -> bool:
-    """Check if a port is free on a remote machine."""
-    out = run_ssh(machine, f"ss -tln | grep -q ':{port} ' && echo USED || echo FREE")
-    return out == "FREE"
-
-
-def find_free_port(machines: list[str]) -> int:
-    """Find a port from ALLOWED_PORTS that is free on all given machines."""
-    print("Probing for a free port across all selected machines...")
-    for port in ALLOWED_PORTS:
-        free_on_all = True
-        for m in machines:
-            if not is_port_free(m, port):
-                print(f"  Port {port}: in use on {m}")
-                free_on_all = False
-                break
-        if free_on_all:
-            print(f"  Port {port}: FREE on all machines")
-            return port
-
-    print("ERROR: no free port found across all machines", file=sys.stderr)
-    sys.exit(1)
-
-
-def launch_tmux(machines: list[str], ips: list[str], port: int):
-    """Create a tmux session with one window per node, each running the program."""
-    ip_args = " ".join(ips)
+def launch_tmux():
+    """Launch NUM_NODES local processes in a tmux session, each on a different port."""
+    ports = [BASE_PORT + i for i in range(NUM_NODES)]
+    addr_args = " ".join(f"127.0.0.1:{p}" for p in ports)
 
     subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION],
                    capture_output=True)
-    time.sleep(0.5)
+    time.sleep(0.3)
 
-    def wrap_cmd(machine, idx):
-        remote_cmd = f"{PROGRAM_PATH} {idx} {port} {ip_args}"
-        return f"ssh {ssh_host(machine)} '{remote_cmd}' 2>&1; echo \"--- exited with code $? ---\"; read -p 'Press enter to close...'"
+    for idx in range(NUM_NODES):
+        cmd = f"{PROGRAM_PATH} {idx} {ports[idx]} {addr_args}"
+        bash_cmd = f"{cmd} 2>&1; echo '--- exited with code '$?' ---'; read -p 'Press enter to close...'"
 
-    subprocess.run(
-        ["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", machines[0],
-         "bash", "-c", wrap_cmd(machines[0], 0)],
-        check=True,
-    )
-    print(f"  Window 0: {machines[0]} (index=0)")
+        if idx == 0:
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", f"node{idx}",
+                 "bash", "-c", bash_cmd],
+                check=True,
+            )
+        else:
+            subprocess.run(
+                ["tmux", "new-window", "-t", TMUX_SESSION, "-n", f"node{idx}",
+                 "bash", "-c", bash_cmd],
+                check=True,
+            )
+        print(f"  Window {idx}: node{idx} (port={ports[idx]})")
 
-    for idx in range(1, len(machines)):
-        machine = machines[idx]
-        subprocess.run(
-            ["tmux", "new-window", "-t", TMUX_SESSION, "-n", machine,
-             "bash", "-c", wrap_cmd(machine, idx)],
-            check=True,
-        )
-        print(f"  Window {idx}: {machine} (index={idx})")
-
-    print(f"\nAll {len(machines)} nodes launched in tmux session '{TMUX_SESSION}'.")
+    print(f"\nAll {NUM_NODES} nodes launched in tmux session '{TMUX_SESSION}'.")
     print(f"Attach with:  tmux attach -t {TMUX_SESSION}")
 
 
 def stop_and_collect():
-    """Send SIGINT to all nodes via SSH, wait for shutdown, capture and aggregate stats."""
+    """Send SIGINT to all node processes, wait for shutdown, capture and aggregate stats."""
     result = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
                             capture_output=True)
     if result.returncode != 0:
         print(f"No tmux session '{TMUX_SESSION}' found.")
         sys.exit(1)
 
+    # Get window list
     result = subprocess.run(
         ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", "#{window_index} #{window_name}"],
         capture_output=True, text=True,
     )
     windows = []
-    machines = []
     for line in result.stdout.strip().split("\n"):
         parts = line.split()
         windows.append(parts[0])
-        machines.append(parts[1].rstrip("-*"))
 
-    print(f"Sending SIGINT to {len(machines)} nodes via SSH...")
+    # Find the actual program PIDs (exclude bash wrappers, grep, pgrep)
+    print(f"Sending SIGINT to {len(windows)} nodes...")
+    result = subprocess.run(
+        ["pgrep", "-x", "Replicated_Has"],  # pgrep matches up to 15 chars of comm
+        capture_output=True, text=True,
+    )
+    pids = []
+    if result.stdout.strip():
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            if line:
+                pids.append(int(line))
 
-    procs = []
-    for m in machines:
-        p = subprocess.Popen(
-            ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
-             ssh_host(m), "pkill -INT -f Replicated_Hash_Table"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        procs.append(p)
+    if not pids:
+        # Fallback: use pidof
+        result = subprocess.run(["pidof", "Replicated_Hash_Table"],
+                                capture_output=True, text=True)
+        if result.stdout.strip():
+            pids = [int(p) for p in result.stdout.strip().split()]
 
-    for p in procs:
-        p.wait()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
 
+    print(f"  Sent SIGINT to PIDs: {pids}")
     print("Waiting for nodes to shut down...")
-    time.sleep(10)
+    time.sleep(5)
 
     total_successful = 0
     total_throughput = 0.0
@@ -288,9 +187,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "stop":
         stop_and_collect()
     else:
-        chosen, ips = select_and_resolve(NUM_NODES)
-        port = find_free_port(chosen)
-        launch_tmux(chosen, ips, port)
+        launch_tmux()
 
 
 if __name__ == "__main__":

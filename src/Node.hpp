@@ -13,9 +13,14 @@
 #include <string>
 #include <vector>
 #include <shared_mutex>
+#include <unordered_map>
+
+struct PendingTx {
+    std::vector<std::pair<int32_t, std::string>> kvs;
+};
 
 class Node{
-    static constexpr int CONNS_PER_PEER = 2;
+    static constexpr int CONNS_PER_PEER = 4;
 
     gtl::parallel_flat_hash_map_m<int32_t, std::string> table;
 
@@ -39,6 +44,15 @@ class Node{
 
     int8_t my_idx;
 
+    // 2PC transaction state
+    std::atomic<uint32_t> tx_counter{0};
+    std::mutex pending_mtx;
+    std::unordered_map<uint64_t, PendingTx> pending_txs;
+
+    uint64_t next_tx_id() {
+        return (static_cast<uint64_t>(my_idx) << 32) | tx_counter.fetch_add(1);
+    }
+
     int8_t replica_idx() const {
         return (my_idx + 1) % static_cast<int8_t>(all_nodes.size());
     }
@@ -50,15 +64,18 @@ class Node{
     size_t send_request(int8_t dest, const Request &req, Response &resp);
     void handle_request(const Request &req, Response &resp);
 
+    // 2PC participant handlers (called from handle_request, no outbound RPCs)
+    bool handle_prepare(const Request &req);
+    void handle_commit(uint64_t tx_id);
+    void handle_abort(uint64_t tx_id);
+
 public:
     std::atomic<bool> running{true};
 
     Node(int port, const int argc, const char** argv);
 
     bool put(const int32_t &key, const std::string &val);
-    bool put_not_og(const int32_t &key, const std::string &val);
     bool put3(const std::array<KV_Pair, 3> &kvs);
-    bool put3_not_og(const std::array<KV_Pair, 3> &kvs);
     std::string get(const int32_t &key);
 
     void recv_request();
