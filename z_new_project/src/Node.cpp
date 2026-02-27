@@ -105,7 +105,7 @@ void Node::establish_conns(int myIdx){
         if (i == myIdx) continue;
         for (int c = 0; c < CONNS_PER_PEER; c++) {
             if (conns[i][c])
-                set_sock_timeout(*conns[i][c], 5);
+                set_sock_timeout(*conns[i][c], 1);
         }
     }
 }
@@ -137,7 +137,12 @@ void Node::recv_request(){
 
             std::error_code ec;
             asio::read(conn, asio::buffer(recv_buf), ec);
-            if (ec) break;
+            if (ec) {
+                // On timeout, re-check running flag instead of breaking
+                if (ec == asio::error::would_block || ec == asio::error::try_again)
+                    continue;
+                break;
+            }
 
             Request req{};
             Response resp{};
