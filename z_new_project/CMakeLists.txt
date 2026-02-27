@@ -15,4 +15,5 @@ add_executable(Replicated_Hash_Table
         src/main.cpp
 )
 
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
 target_link_libraries(Replicated_Hash_Table pthread)
