@@ -70,7 +70,7 @@ void Node::establish_conns(int myIdx){
         if (i == myIdx) continue;
         if (i > myIdx) {
             for (int c = 0; c < CONNS_PER_PEER; c++) {
-                boost::system::error_code ec;
+                std::error_code ec;
                 for (int attempt = 0; attempt < 120; attempt++) {
                     auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
                     sock->connect(all_nodes[i], ec);
@@ -95,7 +95,7 @@ void Node::establish_conns(int myIdx){
 size_t Node::send_request(int8_t dest, const Request &req, Response &resp){
     std::array<uint8_t, BUF_SIZE> send_buf{};
     std::array<uint8_t, BUF_SIZE> recv_buf{};
-    boost::system::error_code ec;
+    std::error_code ec;
 
     serialize(req, send_buf);
 
@@ -117,7 +117,7 @@ void Node::recv_request(){
             std::array<uint8_t, BUF_SIZE> recv_buf{};
             std::array<uint8_t, BUF_SIZE> send_buf{};
 
-            boost::system::error_code ec;
+            std::error_code ec;
             asio::read(conn, asio::buffer(recv_buf), ec);
             if (ec) break;
 
@@ -149,7 +149,7 @@ void Node::recv_request(){
 void Node::stop(){
     running.store(false);
 
-    boost::system::error_code ec;
+    std::error_code ec;
     const int N = static_cast<int>(all_nodes.size());
     for (int i = 0; i < N; i++) {
         if (i == my_idx) continue;

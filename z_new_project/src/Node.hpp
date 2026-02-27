@@ -1,8 +1,7 @@
 #pragma once
 
 #include "../libs/ds/hashmap/phmap.hpp"
-#include <boost/asio.hpp>
-namespace asio = boost::asio;
+#include "../libs/networking/asio.hpp"
 #include "../libs/utils.hpp"
 
 #include <array>

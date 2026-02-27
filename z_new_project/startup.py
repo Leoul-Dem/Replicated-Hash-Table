@@ -8,7 +8,7 @@ import time
 # ─── Configuration ───────────────────────────────────────────────────────────
 SSH_USER = "lgd226"
 DOMAIN = "cse.lehigh.edu"
-PROGRAM_PATH = "~/CSE376/Replicated-Hash-Table/z_new_project/build/Replicated_Hash_Table"  # <── CHANGE THIS
+PROGRAM_PATH = "~/z_new_project/build/Replicated_Hash_Table"  # <── CHANGE THIS
 NUM_NODES = 6
 TMUX_SESSION = "rht"
 

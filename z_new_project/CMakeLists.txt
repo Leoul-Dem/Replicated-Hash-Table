@@ -8,12 +8,11 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -pthread")
 include_directories(libs)
 include_directories(libs/ds)
 include_directories(libs/ds/hashmap)
-cmake_policy(SET CMP0167 OLD)
-find_package(Boost REQUIRED COMPONENTS system)
+include_directories(libs/networking)
 
 add_executable(Replicated_Hash_Table
         src/Node.cpp
         src/main.cpp
 )
 
-target_link_libraries(Replicated_Hash_Table Boost::system)
+target_link_libraries(Replicated_Hash_Table pthread)
