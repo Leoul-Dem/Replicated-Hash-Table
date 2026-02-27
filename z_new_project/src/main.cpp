@@ -7,14 +7,14 @@
 #include <thread>
 #include <signal.h>
 
-// [program] [my_index] [n * ip addresses]
+// [program] [my_index] [port] [n * ip addresses]
 int main(const int argc, const char** argv){
-    if(argc < 6){
-        std::cout << "not enough arguments\n";
+    if(argc < 7){
+        std::cout << "Usage: " << argv[0] << " <index> <port> <ip1> <ip2> ... <ipN>\n";
         return -1;
     }
 
-    int port = 6000;
+    int port = std::atoi(argv[2]);
 
     sigset_t mask;
     sigemptyset(&mask);

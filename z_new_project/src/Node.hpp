@@ -31,7 +31,7 @@ class Node{
     std::vector<std::array<std::mutex, CONNS_PER_PEER>> conn_mtx;
     std::vector<std::atomic<uint32_t>> conn_rr;
 
-    int PORT = 6000;
+    int PORT;
 
     asio::io_context io_ctx;
 

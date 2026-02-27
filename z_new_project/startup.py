@@ -11,9 +11,10 @@ DOMAIN = "cse.lehigh.edu"
 PROGRAM_PATH = "~/z_new_project/build/Replicated_Hash_Table"  # <── CHANGE THIS
 NUM_NODES = 6
 TMUX_SESSION = "rht"
+ALLOWED_PORTS = [1895, 4040, 4041] + list(range(6000, 6011))
 
 MACHINES = [
-    "ariel", "caliban", "callisto", "ceres", "chiron", "cupid",
+    "caliban", "callisto", "ceres", "chiron", "cupid",
     "eris", "europa", "hydra", "iapetus", "io", "ixion",
     "mars", "mercury", "neptune", "nereid", "nix", "orcus",
     "phobos", "puck", "saturn", "triton", "varda", "vesta", "xena",
@@ -102,7 +103,31 @@ def select_and_resolve(n: int) -> tuple[list[str], list[str]]:
     return machines, ips
 
 
-def launch_tmux(machines: list[str], ips: list[str]):
+def is_port_free(machine: str, port: int) -> bool:
+    """Check if a port is free on a remote machine."""
+    out = run_ssh(machine, f"ss -tln | grep -q ':{port} ' && echo USED || echo FREE")
+    return out == "FREE"
+
+
+def find_free_port(machines: list[str]) -> int:
+    """Find a port from ALLOWED_PORTS that is free on all given machines."""
+    print("Probing for a free port across all selected machines...")
+    for port in ALLOWED_PORTS:
+        free_on_all = True
+        for m in machines:
+            if not is_port_free(m, port):
+                print(f"  Port {port}: in use on {m}")
+                free_on_all = False
+                break
+        if free_on_all:
+            print(f"  Port {port}: FREE on all machines")
+            return port
+
+    print("ERROR: no free port found across all machines", file=sys.stderr)
+    sys.exit(1)
+
+
+def launch_tmux(machines: list[str], ips: list[str], port: int):
     """Create a tmux session with one window per node, each running the program."""
     ip_args = " ".join(ips)
 
@@ -111,7 +136,7 @@ def launch_tmux(machines: list[str], ips: list[str]):
     time.sleep(0.5)
 
     def wrap_cmd(machine, idx):
-        remote_cmd = f"{PROGRAM_PATH} {idx} {ip_args}"
+        remote_cmd = f"{PROGRAM_PATH} {idx} {port} {ip_args}"
         return f"ssh {ssh_host(machine)} '{remote_cmd}' 2>&1; echo \"--- exited with code $? ---\"; read -p 'Press enter to close...'"
 
     subprocess.run(
@@ -264,7 +289,8 @@ def main():
         stop_and_collect()
     else:
         chosen, ips = select_and_resolve(NUM_NODES)
-        launch_tmux(chosen, ips)
+        port = find_free_port(chosen)
+        launch_tmux(chosen, ips, port)
 
 
 if __name__ == "__main__":

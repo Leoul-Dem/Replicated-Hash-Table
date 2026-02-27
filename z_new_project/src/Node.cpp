@@ -7,7 +7,7 @@
 #include <thread>
 #include <algorithm>
 
-Node::Node(int port, const int argc, const char** argv){
+Node::Node(int port, const int argc, const char** argv) : PORT(port) {
     parse_node_addrs(argc, argv);
     create_server(port);
     establish_conns(my_idx);
@@ -16,7 +16,7 @@ Node::Node(int port, const int argc, const char** argv){
 void Node::parse_node_addrs(const int argc, const char** argv){
     my_idx = std::atoi(argv[1]);
 
-    for (int i = 2; i < argc; i++) {
+    for (int i = 3; i < argc; i++) {
         asio::ip::tcp::endpoint ep(
             asio::ip::make_address(argv[i]),
             PORT
@@ -26,11 +26,10 @@ void Node::parse_node_addrs(const int argc, const char** argv){
 }
 
 void Node::create_server(const int port){
-    acceptor = std::make_unique<asio::ip::tcp::acceptor>(
-        io_ctx,
-        asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)
-    );
+    acceptor = std::make_unique<asio::ip::tcp::acceptor>(io_ctx);
+    acceptor->open(asio::ip::tcp::v4());
     acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
+    acceptor->bind(asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port));
 }
 
 void Node::establish_conns(int myIdx){
