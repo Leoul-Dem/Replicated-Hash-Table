@@ -30,20 +30,18 @@ inline int runClient(moodycamel::ConcurrentQueue<Request_Cut> &req_queue,
             Request_Cut req{};
             req.id = temp_idx;
 
+            // 60% GET, 20% single PUT, 20% 3 PUT
             if(roll < 60){
-                // 60% GET
                 req.op = GET;
                 req.input_count = 1;
                 req.inputs[0].key = std::rand() % 1000000;
             } else if(roll < 80){
-                // 20% single PUT
                 req.op = PUT;
                 req.input_count = 1;
                 req.inputs[0].key = std::rand() % 1000000;
                 std::memset(req.inputs[0].value, 0, MAX_VAL_SIZE);
                 std::memcpy(req.inputs[0].value, "blah", 4);
             } else {
-                // 20% multi PUT (3 keys)
                 req.op = PUT3;
                 req.input_count = 3;
                 for (int i = 0; i < 3; i++) {

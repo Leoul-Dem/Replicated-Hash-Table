@@ -66,7 +66,6 @@ void Node::establish_conns(int myIdx){
 
     std::vector<int> accepted_per_peer(N, 0);
 
-    // Handshake: connector sends its 1-byte index, acceptor reads it to identify peer
     std::thread accept_thread([&]() {
         for (int a = 0; a < accept_count; a++) {
             auto sock = std::make_unique<asio::ip::tcp::socket>(acceptor->accept());
@@ -91,7 +90,6 @@ void Node::establish_conns(int myIdx){
                     auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
                     sock->connect(all_nodes[i], ec);
                     if (!ec) {
-                        // Send our index as handshake
                         uint8_t idx_byte = static_cast<uint8_t>(myIdx);
                         asio::write(*sock, asio::buffer(&idx_byte, 1), ec);
                         if (!ec) {
@@ -112,7 +110,6 @@ void Node::establish_conns(int myIdx){
 
     accept_thread.join();
 
-    // Set timeouts and TCP_NODELAY on all sockets
     for (int i = 0; i < N; i++) {
         if (i == myIdx) continue;
         for (int c = 0; c < CONNS_PER_PEER; c++) {
@@ -201,7 +198,6 @@ void Node::stop(){
     }
 }
 
-// ─── handle_request: dispatches incoming RPCs ───────────────────────────────
 
 void Node::handle_request(const Request &req, Response &resp){
     resp.id = req.id;
@@ -240,7 +236,7 @@ void Node::handle_request(const Request &req, Response &resp){
     }
 }
 
-// ─── 2PC participant handlers (NO outbound RPCs) ────────────────────────────
+// 2PC participant handlers
 
 bool Node::handle_prepare(const Request &req) {
     // PREPARE: just stage the KVs, no locks held across phases
@@ -284,7 +280,6 @@ void Node::handle_abort(uint64_t tx_id) {
     pending_txs.erase(tx_id);
 }
 
-// ─── helpers ────────────────────────────────────────────────────────────────
 
 static void fill_wire_kv(WireKV &wkv, int32_t key, const std::string &val) {
     wkv.key = key;
@@ -292,7 +287,6 @@ static void fill_wire_kv(WireKV &wkv, int32_t key, const std::string &val) {
     std::memcpy(wkv.value, val.data(), std::min(val.size(), MAX_VAL_SIZE));
 }
 
-// ─── 2PC coordinator: put() ─────────────────────────────────────────────────
 
 bool Node::put(const int32_t &key, const std::string &val){
     const auto N = static_cast<int8_t>(all_nodes.size());
@@ -300,17 +294,15 @@ bool Node::put(const int32_t &key, const std::string &val){
     int8_t replica = (owner + 1) % N;
     uint64_t txid = next_tx_id();
 
-    // Determine which remote nodes to contact
-    // Participants: owner and replica (may include us)
     std::set<int8_t> remote_participants;
     if (owner != my_idx) remote_participants.insert(owner);
     if (replica != my_idx) remote_participants.insert(replica);
 
-    // Phase 1: PREPARE
+    // PREPARE
     bool all_ok = true;
-    std::set<int8_t> voted_yes;  // remote nodes that said yes
+    std::set<int8_t> voted_yes;
 
-    // Prepare locally if we're a participant
+    // Local prep
     bool local_participant = (owner == my_idx || replica == my_idx);
     bool local_prepared = false;
     if (local_participant) {
@@ -323,7 +315,7 @@ bool Node::put(const int32_t &key, const std::string &val){
         local_prepared = true;
     }
 
-    // Prepare remote participants
+    // Remote prep
     if (all_ok) {
         for (int8_t dest : remote_participants) {
             Request req{};
@@ -345,7 +337,7 @@ bool Node::put(const int32_t &key, const std::string &val){
         }
     }
 
-    // Phase 2: COMMIT or ABORT
+    // COMMIT or ABORT
     if (all_ok) {
         // Commit remote
         for (int8_t dest : voted_yes) {
@@ -377,8 +369,6 @@ bool Node::put(const int32_t &key, const std::string &val){
     }
 }
 
-// ─── 2PC coordinator: put3() ────────────────────────────────────────────────
-
 bool Node::put3(const std::array<KV_Pair, 3> &kvs){
     const auto N = static_cast<int8_t>(all_nodes.size());
     uint64_t txid = next_tx_id();
@@ -402,7 +392,7 @@ bool Node::put3(const std::array<KV_Pair, 3> &kvs){
     std::set<int8_t> voted_yes;
     bool local_prepared = false;
 
-    // Prepare local if we're a participant
+    // Local prep
     auto local_it = participants.find(my_idx);
     if (local_it != participants.end()) {
         PendingTx tx;
@@ -414,7 +404,7 @@ bool Node::put3(const std::array<KV_Pair, 3> &kvs){
         local_prepared = true;
     }
 
-    // Prepare remote participants
+    // Remote prep
     if (all_ok) {
         for (auto& [node_id, pdata] : participants) {
             if (node_id == my_idx) continue;
@@ -440,7 +430,6 @@ bool Node::put3(const std::array<KV_Pair, 3> &kvs){
         }
     }
 
-    // Phase 2
     if (all_ok) {
         for (int8_t dest : voted_yes) {
             Request req{};
@@ -468,7 +457,6 @@ bool Node::put3(const std::array<KV_Pair, 3> &kvs){
     }
 }
 
-// ─── get() — unchanged, no 2PC needed ───────────────────────────────────────
 
 std::string Node::get(const int32_t &key){
     const auto N = static_cast<int8_t>(all_nodes.size());

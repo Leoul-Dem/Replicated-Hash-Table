@@ -31,7 +31,6 @@ class Node{
 
     std::vector<asio::ip::tcp::endpoint> all_nodes;
 
-    // Per-peer connections: conns[peer_idx][0..CONNS_PER_PEER-1]
     std::vector<std::array<std::unique_ptr<asio::ip::tcp::socket>, CONNS_PER_PEER>> conns;
     std::vector<std::array<std::mutex, CONNS_PER_PEER>> conn_mtx;
     std::vector<std::atomic<uint32_t>> conn_rr;
