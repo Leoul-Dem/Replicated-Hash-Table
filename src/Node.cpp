@@ -1,26 +1,32 @@
-//
-// Created by leoul on 2/18/26.
-//
-//
-
-#include "Node.h"
+#include "Node.hpp"
 #include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <thread>
-#include <signal.h>
+#include <algorithm>
+#include <sys/socket.h>
 
-Node::Node(const int port, const int argc, char** argv){
-    this->parse_node_addrs(argc, argv);
-    this->create_server(port);
-    this->establish_connections(my_idx);
+static void set_sock_timeout(asio::ip::tcp::socket &sock, int seconds) {
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    int fd = sock.native_handle();
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-void Node::parse_node_addrs(const int argc, char** argv){
-    my_idx = atoi(argv[1]);
+Node::Node(int port, const int argc, const char** argv) : PORT(port) {
+    parse_node_addrs(argc, argv);
+    create_server(port);
+    establish_conns(my_idx);
+}
 
-    for (int i = 2; i < argc; i++) {
+void Node::parse_node_addrs(const int argc, const char** argv){
+    my_idx = std::atoi(argv[1]);
+
+    for (int i = 3; i < argc; i++) {
         asio::ip::tcp::endpoint ep(
             asio::ip::make_address(argv[i]),
             PORT
@@ -30,189 +36,424 @@ void Node::parse_node_addrs(const int argc, char** argv){
 }
 
 void Node::create_server(const int port){
-    acceptor = std::make_unique<asio::ip::tcp::acceptor>(
-        io_ctx,
-        asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)
-    );
+    acceptor = std::make_unique<asio::ip::tcp::acceptor>(io_ctx);
+    acceptor->open(asio::ip::tcp::v4());
     acceptor->set_option(asio::ip::tcp::acceptor::reuse_address(true));
+    acceptor->bind(asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port));
 }
 
-void Node::establish_connections(const int myIdx){
-    // In a circular topology each node connects to its left, right, and farthest peers.
-    // Each node accepts from lower-indexed peers and connects to higher-indexed peers.
-    // A background thread handles accepts concurrently with connects to avoid deadlock
-    // when farthest peers create out-of-order index dependencies.
-
+void Node::establish_conns(int myIdx){
     const int N = static_cast<int>(all_nodes.size());
-    peers.left_idx  = myIdx == 0 ? N - 1 : myIdx - 1;
-    peers.right_idx = myIdx == N - 1 ? 0 : myIdx + 1;
-    peers.farthest_idx = (myIdx + N / 2) % N;
 
-    const int peer_indices[3] = { peers.left_idx, peers.right_idx, peers.farthest_idx };
-    std::unique_ptr<asio::ip::tcp::socket>* peer_conns[3] = {
-        &peers.left_conn, &peers.right_conn, &peers.farthest_conn
-    };
+    conns.resize(N);
+    conn_mtx = std::vector<std::array<std::mutex, CONNS_PER_PEER>>(N);
+    conn_rr = std::vector<std::atomic<uint32_t>>(N);
 
-    // Count how many peers we need to accept connections from (those with lower index)
     int accept_count = 0;
-    for (int i = 0; i < 3; i++) {
-        if (peer_indices[i] < myIdx)
-            accept_count++;
+    for (int i = 0; i < N; i++) {
+        if (i < myIdx)
+            accept_count += CONNS_PER_PEER;
     }
 
-    acceptor->listen(accept_count);
+    acceptor->listen(accept_count + 16);
 
-    // Accept from lower-indexed peers in a background thread so connects can proceed concurrently
+    std::vector<int> accepted_per_peer(N, 0);
+
     std::thread accept_thread([&]() {
         for (int a = 0; a < accept_count; a++) {
             auto sock = std::make_unique<asio::ip::tcp::socket>(acceptor->accept());
-
-            // Match the accepted connection to the correct peer by address
             auto remote_addr = sock->remote_endpoint().address();
-            for (int i = 0; i < 3; i++) {
-                if (peer_indices[i] < myIdx &&
-                    remote_addr == all_nodes[peer_indices[i]].address()) {
-                    *peer_conns[i] = std::move(sock);
+            for (int i = 0; i < N; i++) {
+                if (i < myIdx &&
+                    remote_addr == all_nodes[i].address() &&
+                    accepted_per_peer[i] < CONNS_PER_PEER) {
+                    conns[i][accepted_per_peer[i]] = std::move(sock);
+                    accepted_per_peer[i]++;
                     break;
                 }
             }
         }
     });
 
-    // Initiate connections to higher-indexed peers concurrently with the accept thread.
-    // Retry with backoff since peers may not be listening yet.
-    for (int i = 0; i < 3; i++) {
-        if (peer_indices[i] > myIdx) {
-            asio::error_code ec;
-            for (int attempt = 0; attempt < 120; attempt++) {
-                auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
-                sock->connect(all_nodes[peer_indices[i]], ec);
-                if (!ec) {
-                    *peer_conns[i] = std::move(sock);
-                    break;
+    for (int i = 0; i < N; i++) {
+        if (i == myIdx) continue;
+        if (i > myIdx) {
+            for (int c = 0; c < CONNS_PER_PEER; c++) {
+                std::error_code ec;
+                for (int attempt = 0; attempt < 120; attempt++) {
+                    auto sock = std::make_unique<asio::ip::tcp::socket>(io_ctx);
+                    sock->connect(all_nodes[i], ec);
+                    if (!ec) {
+                        conns[i][c] = std::move(sock);
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
-            if (ec) {
-                std::fprintf(stderr, "Failed to connect to node %d after retries: %s\n",
-                             peer_indices[i], ec.message().c_str());
-                std::exit(1);
+                if (ec) {
+                    std::fprintf(stderr, "Failed to connect to node %d: %s\n",
+                                 i, ec.message().c_str());
+                    std::exit(1);
+                }
             }
         }
     }
 
     accept_thread.join();
+
+    // Set timeouts on all sockets so blocking IO breaks during shutdown
+    for (int i = 0; i < N; i++) {
+        if (i == myIdx) continue;
+        for (int c = 0; c < CONNS_PER_PEER; c++) {
+            if (conns[i][c])
+                set_sock_timeout(*conns[i][c], 1);
+        }
+    }
 }
 
-size_t Node::send_request(const Request_Full &req, Response_Full &resp){
+size_t Node::send_request(int8_t dest, const Request &req, Response &resp){
     std::array<uint8_t, BUF_SIZE> send_buf{};
     std::array<uint8_t, BUF_SIZE> recv_buf{};
-    asio::error_code ec;
+    std::error_code ec;
 
     serialize(req, send_buf);
-    const auto N = static_cast<int8_t>(all_nodes.size());
-    const auto ring_dist = [N](int8_t a, int8_t b) -> uint8_t {
-        int8_t d = (b - a + N) % N;
-        return std::min(static_cast<uint8_t>(d), static_cast<uint8_t>(N - d));
-    };
-    const uint8_t my_diff = ring_dist(req.src, req.dest);
 
-    if(const uint8_t farthest_diff = ring_dist(peers.farthest_idx, req.dest); farthest_diff < my_diff + 1){
-        std::lock_guard<std::mutex> lock(peers.farthest_mtx);
-        asio::write(*peers.farthest_conn, asio::buffer(send_buf), ec);
-        if(ec) return 0;
-        asio::read(*peers.farthest_conn, asio::buffer(recv_buf), ec);
-        if(ec) return 0;
-        deserialize(recv_buf, resp);
-        return recv_buf.size();
-    }
-    const int8_t dest = req.dest;
+    int c = conn_rr[dest].fetch_add(1, std::memory_order_relaxed) % CONNS_PER_PEER;
+    std::lock_guard<std::mutex> lock(conn_mtx[dest][c]);
 
-    const int8_t left_dist  = (dest - my_idx + N) % N;
-    const int8_t right_dist = (my_idx - dest + N) % N;
+    asio::write(*conns[dest][c], asio::buffer(send_buf), ec);
+    if (ec) return 0;
+    asio::read(*conns[dest][c], asio::buffer(recv_buf), ec);
+    if (ec) return 0;
 
-    if(left_dist >= right_dist){
-        std::lock_guard<std::mutex> lock(peers.right_mtx);
-        asio::write(*peers.right_conn, asio::buffer(send_buf), ec);
-        if(ec) return 0;
-        asio::read(*peers.right_conn, asio::buffer(recv_buf), ec);
-        if(ec) return 0;
-    } else {
-        std::lock_guard<std::mutex> lock(peers.left_mtx);
-        asio::write(*peers.left_conn, asio::buffer(send_buf), ec);
-        if(ec) return 0;
-        asio::read(*peers.left_conn, asio::buffer(recv_buf), ec);
-        if(ec) return 0;
-    }
     deserialize(recv_buf, resp);
-
     return recv_buf.size();
 }
 
-
 void Node::recv_request(){
     auto run = [this](asio::ip::tcp::socket& conn){
-        while(running.load()){
+        while (running.load()) {
             std::array<uint8_t, BUF_SIZE> recv_buf{};
             std::array<uint8_t, BUF_SIZE> send_buf{};
 
-            asio::error_code ec;
+            std::error_code ec;
             asio::read(conn, asio::buffer(recv_buf), ec);
-            if (ec)
+            if (ec) {
+                // On timeout, re-check running flag instead of breaking
+                if (ec == asio::error::would_block || ec == asio::error::try_again)
+                    continue;
                 break;
+            }
 
-            Request_Full req{};
-            Response_Full resp{};
+            Request req{};
+            Response resp{};
             deserialize(recv_buf, req);
 
             handle_request(req, resp);
 
             serialize(resp, send_buf);
             asio::write(conn, asio::buffer(send_buf), ec);
-            if (ec)
-                break;
+            if (ec) break;
         }
     };
 
-    std::thread t1(run, std::ref(*peers.left_conn));
-    std::thread t2(run, std::ref(*peers.right_conn));
-    std::thread t3(run, std::ref(*peers.farthest_conn));
+    const int N = static_cast<int>(all_nodes.size());
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N; i++) {
+        if (i == my_idx) continue;
+        for (int c = 0; c < CONNS_PER_PEER; c++) {
+            threads.emplace_back(run, std::ref(*conns[i][c]));
+        }
+    }
 
-    t1.join();
-    t2.join();
-    t3.join();
+    for (auto& t : threads)
+        t.join();
 }
 
 void Node::stop(){
     running.store(false);
 
-    // Closing sockets unblocks any blocked read()/write() calls
-    asio::error_code ec;
-    if(peers.left_conn)     peers.left_conn->close(ec);
-    if(peers.right_conn)    peers.right_conn->close(ec);
-    if(peers.farthest_conn) peers.farthest_conn->close(ec);
+    std::error_code ec;
+    if (acceptor && acceptor->is_open())
+        acceptor->close(ec);
+
+    const int N = static_cast<int>(all_nodes.size());
+    for (int i = 0; i < N; i++) {
+        if (i == my_idx) continue;
+        for (int c = 0; c < CONNS_PER_PEER; c++) {
+            if (conns[i][c] && conns[i][c]->is_open())
+                conns[i][c]->close(ec);
+        }
+    }
 }
 
-void Node::handle_request(const Request_Full &req, Response_Full &resp){
+void Node::handle_request(const Request &req, Response &resp){
+    resp.id = req.id;
+    resp.src = req.src;
+    resp.dest = req.dest;
+
     switch (req.op) {
-        case GET:{
-            resp.id = req.id;
-            resp.src = req.src;
-            resp.dest = req.dest;
-            resp.output = this->get(req.inputs[0].key);
+        case GET: {
+            std::string result = get(req.inputs[0].key);
+            std::memset(resp.output, 0, MAX_VAL_SIZE);
+            std::memcpy(resp.output, result.data(),
+                        std::min(result.size(), MAX_VAL_SIZE));
+            resp.success = !result.empty();
             break;
+        }
+        case PUT: {
+            std::string val(req.inputs[0].value, strnlen(req.inputs[0].value, MAX_VAL_SIZE));
+            resp.success = put(req.inputs[0].key, val);
+            break;
+        }
+        case PUT_NOT_OG: {
+            std::string val(req.inputs[0].value, strnlen(req.inputs[0].value, MAX_VAL_SIZE));
+            resp.success = put_not_og(req.inputs[0].key, val);
+            break;
+        }
+        case PUT3: {
+            std::array<KV_Pair, 3> kvs;
+            for (int i = 0; i < 3; i++) {
+                kvs[i].key = req.inputs[i].key;
+                kvs[i].value = std::string(req.inputs[i].value, strnlen(req.inputs[i].value, MAX_VAL_SIZE));
+            }
+            resp.success = put3(kvs);
+            break;
+        }
+        case PUT3_NOT_OG: {
+            std::array<KV_Pair, 3> kvs;
+            for (int i = 0; i < 3; i++) {
+                kvs[i].key = req.inputs[i].key;
+                kvs[i].value = std::string(req.inputs[i].value, strnlen(req.inputs[i].value, MAX_VAL_SIZE));
+            }
+            resp.success = put3_not_og(kvs);
+            break;
+        }
+    }
+}
+
+// --- helpers ---
+
+static void fill_wire_kv(WireKV &wkv, int32_t key, const std::string &val) {
+    wkv.key = key;
+    std::memset(wkv.value, 0, MAX_VAL_SIZE);
+    std::memcpy(wkv.value, val.data(), std::min(val.size(), MAX_VAL_SIZE));
+}
+
+// --- Public API ---
+
+bool Node::put(const int32_t &key, const std::string &val){
+    const auto N = static_cast<int8_t>(all_nodes.size());
+    int8_t owner = key % N;
+
+    if (owner == my_idx) {
+        std::unique_lock<std::shared_timed_mutex> lk(locks[stripe(key)]);
+
+        // Synchronous replica write
+        int8_t rep = replica_idx();
+        Request req{};
+        req.src = my_idx;
+        req.dest = rep;
+        req.op = PUT_NOT_OG;
+        req.input_count = 1;
+        fill_wire_kv(req.inputs[0], key, val);
+
+        Response resp{};
+        send_request(rep, req, resp);
+
+        if (resp.success) {
+            table.insert_or_assign(key, val);
+            return true;
+        }
+        return false;
+    } else {
+        // Forward to owner
+        Request req{};
+        req.src = my_idx;
+        req.dest = owner;
+        req.op = PUT;
+        req.input_count = 1;
+        fill_wire_kv(req.inputs[0], key, val);
+
+        Response resp{};
+        send_request(owner, req, resp);
+        return resp.success;
+    }
+}
+
+bool Node::put_not_og(const int32_t &key, const std::string &val){
+    std::unique_lock<std::shared_timed_mutex> lk(locks[stripe(key)]);
+    table.insert_or_assign(key, val);
+    return true;
+}
+
+bool Node::put3(const std::array<KV_Pair, 3> &kvs){
+    const auto N = static_cast<int8_t>(all_nodes.size());
+
+    // Group keys by owner
+    // For each key: if we own it, write locally + fire-and-forget replica
+    // If remote owns it, send PUT3_NOT_OG to that owner (they write locally)
+    // Fire-and-forget: we don't wait for replica ACKs
+
+    // Lock local stripes first (sorted to prevent deadlock)
+    std::array<int, 3> order = {0, 1, 2};
+    std::sort(order.begin(), order.end(), [&](int a, int b){
+        return stripe(kvs[a].key) < stripe(kvs[b].key);
+    });
+
+    std::array<std::unique_lock<std::shared_timed_mutex>, 3> local_locks;
+    for (int i = 0; i < 3; i++) {
+        int idx = order[i];
+        int8_t owner = kvs[idx].key % N;
+        if (owner == my_idx || (owner + 1) % N == my_idx) {
+            // We hold this key locally (as primary or replica)
+            if (i > 0 && stripe(kvs[order[i]].key) == stripe(kvs[order[i-1]].key))
+                continue;
+            local_locks[idx] = std::unique_lock<std::shared_timed_mutex>(
+                locks[stripe(kvs[idx].key)], std::chrono::milliseconds(5));
+            if (!local_locks[idx].owns_lock()) return false;
+        }
+    }
+
+    // Send fire-and-forget replica writes for keys we own
+    for (int i = 0; i < 3; i++) {
+        int8_t owner = kvs[i].key % N;
+        if (owner == my_idx) {
+            int8_t rep = replica_idx();
+            Request req{};
+            req.src = my_idx;
+            req.dest = rep;
+            req.op = PUT_NOT_OG;
+            req.input_count = 1;
+            fill_wire_kv(req.inputs[0], kvs[i].key, kvs[i].value);
+
+            Response resp{};
+            send_request(rep, req, resp);
+            // Fire and forget — don't check resp.success
+        }
+    }
+
+    // Send PUT3_NOT_OG to remote owners for keys we don't own
+    // Group by owner to batch
+    struct RemoteGroup { int8_t dest; std::vector<int> indices; };
+    std::vector<RemoteGroup> remote_groups;
+
+    for (int i = 0; i < 3; i++) {
+        int8_t owner = kvs[i].key % N;
+        if (owner == my_idx) continue;
+
+        bool found = false;
+        for (auto& g : remote_groups) {
+            if (g.dest == owner) {
+                g.indices.push_back(i);
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            remote_groups.push_back({owner, {i}});
+    }
+
+    for (auto& g : remote_groups) {
+        Request req{};
+        req.src = my_idx;
+        req.dest = g.dest;
+        req.op = PUT3_NOT_OG;
+        req.input_count = static_cast<uint8_t>(g.indices.size());
+        for (size_t j = 0; j < g.indices.size(); j++) {
+            fill_wire_kv(req.inputs[j], kvs[g.indices[j]].key, kvs[g.indices[j]].value);
         }
 
-        case PUT:{
-            resp.id = req.id;
-            resp.src = req.src;
-            resp.dest = req.dest;
-            if(req.input_count == 1){
-                resp.success = this->put(req.inputs[0], false);
-            }else{
-                resp.success = this->put(req.inputs, false);
-            }
-            break;
+        Response resp{};
+        send_request(g.dest, req, resp);
+        // Fire and forget
+    }
+
+    // Write all locally-held keys
+    for (int i = 0; i < 3; i++) {
+        int8_t owner = kvs[i].key % N;
+        if (owner == my_idx || (owner + 1) % N == my_idx) {
+            table.insert_or_assign(kvs[i].key, kvs[i].value);
         }
+    }
+
+    return true;
+}
+
+bool Node::put3_not_og(const std::array<KV_Pair, 3> &kvs){
+    // Called on a remote primary that received keys from the coordinator.
+    // Write locally + fire-and-forget replica for keys we own.
+    const auto N = static_cast<int8_t>(all_nodes.size());
+
+    // Lock stripes
+    std::array<int, 3> order = {0, 1, 2};
+    std::sort(order.begin(), order.end(), [&](int a, int b){
+        return stripe(kvs[a].key) < stripe(kvs[b].key);
+    });
+
+    std::array<std::unique_lock<std::shared_timed_mutex>, 3> local_locks;
+    for (int i = 0; i < 3; i++) {
+        int idx = order[i];
+        int8_t owner = kvs[idx].key % N;
+        if (owner != my_idx) continue;
+        if (i > 0 && stripe(kvs[order[i]].key) == stripe(kvs[order[i-1]].key))
+            continue;
+        local_locks[idx] = std::unique_lock<std::shared_timed_mutex>(
+            locks[stripe(kvs[idx].key)], std::chrono::milliseconds(5));
+        if (!local_locks[idx].owns_lock()) return false;
+    }
+
+    // Fire-and-forget replica writes
+    for (int i = 0; i < 3; i++) {
+        int8_t owner = kvs[i].key % N;
+        if (owner != my_idx) continue;
+
+        int8_t rep = replica_idx();
+        Request req{};
+        req.src = my_idx;
+        req.dest = rep;
+        req.op = PUT_NOT_OG;
+        req.input_count = 1;
+        fill_wire_kv(req.inputs[0], kvs[i].key, kvs[i].value);
+
+        Response resp{};
+        send_request(rep, req, resp);
+    }
+
+    // Write locally
+    for (int i = 0; i < 3; i++) {
+        int8_t owner = kvs[i].key % N;
+        if (owner != my_idx) continue;
+        table.insert_or_assign(kvs[i].key, kvs[i].value);
+    }
+
+    return true;
+}
+
+std::string Node::get(const int32_t &key){
+    const auto N = static_cast<int8_t>(all_nodes.size());
+    int8_t owner = key % N;
+
+    int8_t owner_replica = (owner + 1) % N;
+    if (owner == my_idx || owner_replica == my_idx) {
+        std::shared_lock<std::shared_timed_mutex> lk(locks[stripe(key)]);
+        std::string result;
+        table.if_contains(key, [&result](const auto& item) {
+            result = item.second;
+        });
+        return result;
+    } else {
+        int8_t dest = (std::rand() % 2) ? owner : owner_replica;
+
+        Request req{};
+        req.src = my_idx;
+        req.dest = dest;
+        req.op = GET;
+        req.input_count = 1;
+        req.inputs[0].key = key;
+
+        Response resp{};
+        send_request(dest, req, resp);
+
+        return std::string(resp.output, strnlen(resp.output, MAX_VAL_SIZE));
     }
 }

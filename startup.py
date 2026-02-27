@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import re
 import subprocess
 import sys
 import time
@@ -7,12 +8,13 @@ import time
 # ─── Configuration ───────────────────────────────────────────────────────────
 SSH_USER = "lgd226"
 DOMAIN = "cse.lehigh.edu"
-PROGRAM_PATH = "~/CSE376/Replicated-Hash-Table/build/Replicated_Hash_Table"  # <── CHANGE THIS
+PROGRAM_PATH = "~/z_new_project/build/Replicated_Hash_Table"  # <── CHANGE THIS
 NUM_NODES = 6
 TMUX_SESSION = "rht"
+ALLOWED_PORTS = [1895, 4040, 4041] + list(range(6000, 6011))
 
 MACHINES = [
-    "ariel", "caliban", "callisto", "ceres", "chiron", "cupid",
+    "caliban", "callisto", "ceres", "chiron", "cupid",
     "eris", "europa", "hydra", "iapetus", "io", "ixion",
     "mars", "mercury", "neptune", "nereid", "nix", "orcus",
     "phobos", "puck", "saturn", "triton", "varda", "vesta", "xena",
@@ -77,7 +79,7 @@ def pick_best_machines(n: int) -> list[str]:
 
 def select_and_resolve(n: int) -> tuple[list[str], list[str]]:
     """Pick n machines with lowest load that also resolve an IP."""
-    ranked = pick_best_machines(n * 2)  # get extra candidates in case some fail
+    ranked = pick_best_machines(n * 2)
 
     print("Resolving IP addresses...")
     machines: list[str] = []
@@ -101,21 +103,42 @@ def select_and_resolve(n: int) -> tuple[list[str], list[str]]:
     return machines, ips
 
 
-def launch_tmux(machines: list[str], ips: list[str]):
+def is_port_free(machine: str, port: int) -> bool:
+    """Check if a port is free on a remote machine."""
+    out = run_ssh(machine, f"ss -tln | grep -q ':{port} ' && echo USED || echo FREE")
+    return out == "FREE"
+
+
+def find_free_port(machines: list[str]) -> int:
+    """Find a port from ALLOWED_PORTS that is free on all given machines."""
+    print("Probing for a free port across all selected machines...")
+    for port in ALLOWED_PORTS:
+        free_on_all = True
+        for m in machines:
+            if not is_port_free(m, port):
+                print(f"  Port {port}: in use on {m}")
+                free_on_all = False
+                break
+        if free_on_all:
+            print(f"  Port {port}: FREE on all machines")
+            return port
+
+    print("ERROR: no free port found across all machines", file=sys.stderr)
+    sys.exit(1)
+
+
+def launch_tmux(machines: list[str], ips: list[str], port: int):
     """Create a tmux session with one window per node, each running the program."""
     ip_args = " ".join(ips)
 
-    # Kill any existing session with the same name
     subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION],
                    capture_output=True)
     time.sleep(0.5)
 
-    # Wrap commands so the window stays open on exit (shows errors)
     def wrap_cmd(machine, idx):
-        remote_cmd = f"{PROGRAM_PATH} {idx} {ip_args}"
+        remote_cmd = f"{PROGRAM_PATH} {idx} {port} {ip_args}"
         return f"ssh {ssh_host(machine)} '{remote_cmd}' 2>&1; echo \"--- exited with code $? ---\"; read -p 'Press enter to close...'"
 
-    # Create a detached tmux session with the first node
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", machines[0],
          "bash", "-c", wrap_cmd(machines[0], 0)],
@@ -123,7 +146,6 @@ def launch_tmux(machines: list[str], ips: list[str]):
     )
     print(f"  Window 0: {machines[0]} (index=0)")
 
-    # Create additional windows for remaining nodes
     for idx in range(1, len(machines)):
         machine = machines[idx]
         subprocess.run(
@@ -137,9 +159,138 @@ def launch_tmux(machines: list[str], ips: list[str]):
     print(f"Attach with:  tmux attach -t {TMUX_SESSION}")
 
 
+def stop_and_collect():
+    """Send SIGINT to all nodes via SSH, wait for shutdown, capture and aggregate stats."""
+    result = subprocess.run(["tmux", "has-session", "-t", TMUX_SESSION],
+                            capture_output=True)
+    if result.returncode != 0:
+        print(f"No tmux session '{TMUX_SESSION}' found.")
+        sys.exit(1)
+
+    result = subprocess.run(
+        ["tmux", "list-windows", "-t", TMUX_SESSION, "-F", "#{window_index} #{window_name}"],
+        capture_output=True, text=True,
+    )
+    windows = []
+    machines = []
+    for line in result.stdout.strip().split("\n"):
+        parts = line.split()
+        windows.append(parts[0])
+        machines.append(parts[1].rstrip("-*"))
+
+    print(f"Sending SIGINT to {len(machines)} nodes via SSH...")
+
+    procs = []
+    for m in machines:
+        p = subprocess.Popen(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+             ssh_host(m), "pkill -INT -f Replicated_Hash_Table"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        procs.append(p)
+
+    for p in procs:
+        p.wait()
+
+    print("Waiting for nodes to shut down...")
+    time.sleep(10)
+
+    total_successful = 0
+    total_throughput = 0.0
+    total_ops = 0
+    all_p50 = []
+    all_p90 = []
+    all_p99 = []
+    all_avg = []
+    nodes_collected = 0
+
+    for w in windows:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", f"{TMUX_SESSION}:{w}", "-p", "-S", "-200"],
+            capture_output=True, text=True,
+        )
+        output = result.stdout
+
+        raw = output.strip()
+        if raw:
+            for line in raw.split('\n'):
+                if line.strip():
+                    print(f"    | {line}")
+
+        stats = parse_stats(output)
+        if stats:
+            nodes_collected += 1
+            print(f"\n--- Node {w} ---")
+            print(f"  Successful ops: {stats['successful_ops']}")
+            print(f"  Throughput:     {stats['throughput']:.2f} ops/s")
+            print(f"  Total ops:      {stats['total_ops']}")
+            print(f"  Avg latency:    {stats['avg_latency']:.2f} us")
+            print(f"  P50 latency:    {stats['p50']:.2f} us")
+            print(f"  P90 latency:    {stats['p90']:.2f} us")
+            print(f"  P99 latency:    {stats['p99']:.2f} us")
+
+            total_successful += stats['successful_ops']
+            total_throughput += stats['throughput']
+            total_ops += stats['total_ops']
+            all_avg.append((stats['avg_latency'], stats['total_ops']))
+            all_p50.append(stats['p50'])
+            all_p90.append(stats['p90'])
+            all_p99.append(stats['p99'])
+        else:
+            print(f"\n--- Node {w} ---")
+            print(f"  Could not parse stats")
+
+    if nodes_collected > 0:
+        weighted_avg = sum(a * n for a, n in all_avg) / sum(n for _, n in all_avg) if all_avg else 0
+
+        print(f"\n{'=' * 42}")
+        print(f"  Aggregated Stats ({nodes_collected} nodes)")
+        print(f"{'=' * 42}")
+        print(f"  Total successful ops:  {total_successful:,}")
+        print(f"  Combined throughput:   {total_throughput:,.2f} ops/s")
+        print(f"  Total operations:      {total_ops:,}")
+        print(f"  Weighted avg latency:  {weighted_avg:,.2f} us")
+        print(f"  Avg P50 latency:       {sum(all_p50) / len(all_p50):,.2f} us")
+        print(f"  Avg P90 latency:       {sum(all_p90) / len(all_p90):,.2f} us")
+        print(f"  Avg P99 latency:       {sum(all_p99) / len(all_p99):,.2f} us")
+        print(f"{'=' * 42}")
+    else:
+        print("\nNo stats could be collected from any node.")
+
+    subprocess.run(["tmux", "kill-session", "-t", TMUX_SESSION], capture_output=True)
+    print(f"\nSession '{TMUX_SESSION}' terminated.")
+
+
+def parse_stats(output: str) -> dict | None:
+    """Parse performance stats from a node's stdout output."""
+    patterns = {
+        'successful_ops': r'Successful ops:\s+(\d+)',
+        'throughput':     r'Throughput:\s+([\d.]+)',
+        'total_ops':      r'Total operations:\s+(\d+)',
+        'avg_latency':    r'Avg latency:\s+([\d.]+)',
+        'p50':            r'P50 latency:\s+([\d.]+)',
+        'p90':            r'P90 latency:\s+([\d.]+)',
+        'p99':            r'P99 latency:\s+([\d.]+)',
+    }
+
+    stats = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, output)
+        if not match:
+            return None
+        val = match.group(1)
+        stats[key] = int(val) if key in ('successful_ops', 'total_ops') else float(val)
+
+    return stats
+
+
 def main():
-    chosen, ips = select_and_resolve(NUM_NODES)
-    launch_tmux(chosen, ips)
+    if len(sys.argv) > 1 and sys.argv[1] == "stop":
+        stop_and_collect()
+    else:
+        chosen, ips = select_and_resolve(NUM_NODES)
+        port = find_free_port(chosen)
+        launch_tmux(chosen, ips, port)
 
 
 if __name__ == "__main__":
