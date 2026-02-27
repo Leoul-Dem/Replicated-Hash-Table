@@ -6,6 +6,16 @@
 #include <cstring>
 #include <thread>
 #include <algorithm>
+#include <sys/socket.h>
+
+static void set_sock_timeout(asio::ip::tcp::socket &sock, int seconds) {
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    int fd = sock.native_handle();
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
 
 Node::Node(int port, const int argc, const char** argv) : PORT(port) {
     parse_node_addrs(argc, argv);
@@ -89,6 +99,15 @@ void Node::establish_conns(int myIdx){
     }
 
     accept_thread.join();
+
+    // Set timeouts on all sockets so blocking IO breaks during shutdown
+    for (int i = 0; i < N; i++) {
+        if (i == myIdx) continue;
+        for (int c = 0; c < CONNS_PER_PEER; c++) {
+            if (conns[i][c])
+                set_sock_timeout(*conns[i][c], 5);
+        }
+    }
 }
 
 size_t Node::send_request(int8_t dest, const Request &req, Response &resp){
@@ -149,11 +168,15 @@ void Node::stop(){
     running.store(false);
 
     std::error_code ec;
+    if (acceptor && acceptor->is_open())
+        acceptor->close(ec);
+
     const int N = static_cast<int>(all_nodes.size());
     for (int i = 0; i < N; i++) {
         if (i == my_idx) continue;
         for (int c = 0; c < CONNS_PER_PEER; c++) {
-            if (conns[i][c]) conns[i][c]->close(ec);
+            if (conns[i][c] && conns[i][c]->is_open())
+                conns[i][c]->close(ec);
         }
     }
 }

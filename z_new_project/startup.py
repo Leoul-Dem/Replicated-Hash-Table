@@ -8,7 +8,7 @@ import time
 # ─── Configuration ───────────────────────────────────────────────────────────
 SSH_USER = "lgd226"
 DOMAIN = "cse.lehigh.edu"
-PROGRAM_PATH = "~/z_new_project/build/Replicated_Hash_Table"  # <── CHANGE THIS
+PROGRAM_PATH = "~/Replicated-Hash-Table/z_new_project/build/Replicated_Hash_Table"  # <── CHANGE THIS
 NUM_NODES = 6
 TMUX_SESSION = "rht"
 ALLOWED_PORTS = [1895, 4040, 4041] + list(range(6000, 6011))
@@ -137,7 +137,7 @@ def launch_tmux(machines: list[str], ips: list[str], port: int):
 
     def wrap_cmd(machine, idx):
         remote_cmd = f"{PROGRAM_PATH} {idx} {port} {ip_args}"
-        return f"ssh {ssh_host(machine)} '{remote_cmd}' 2>&1; echo \"--- exited with code $? ---\"; read -p 'Press enter to close...'"
+        return f"ssh -tt {ssh_host(machine)} '{remote_cmd}' 2>&1; echo \"--- exited with code $? ---\"; read -p 'Press enter to close...'"
 
     subprocess.run(
         ["tmux", "new-session", "-d", "-s", TMUX_SESSION, "-n", machines[0],
@@ -178,7 +178,7 @@ def stop_and_collect():
         windows.append(parts[0])
         machines.append(parts[1].rstrip("-*"))
 
-    print(f"Sending SIGINT to {len(machines)} nodes simultaneously...")
+    print(f"Sending SIGINT to {len(machines)} nodes via SSH...")
 
     procs = []
     for m in machines:
@@ -193,7 +193,7 @@ def stop_and_collect():
         p.wait()
 
     print("Waiting for nodes to shut down...")
-    time.sleep(15)
+    time.sleep(20)
 
     total_successful = 0
     total_throughput = 0.0
